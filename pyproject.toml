@@ -9,7 +9,7 @@ readme = "README.md"
 license-files = ["LICENSE.md"]
 
 requires-python = ">=3.10, ~=3.13"
-dependencies = []
+dependencies = ["numpy", "matplotlib", "Pillow"]
 
 
 [project.urls]

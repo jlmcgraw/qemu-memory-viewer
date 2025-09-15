@@ -5,19 +5,22 @@
 
 # qemu-memory-viewer
 
-_A vibe-coded attempt to display RAM of a running QEMU emulation of a 486 with 1 MB of memory running DOS_
+_A vibe-coded attempt to dynamically display the contents of RAM for running QEMU emulations with small amounts of memory.
+I just thought it might be fun_
 
 
 ## Super-quick Start
+- install qemu
+- Start the emulation
 
-Requires: Python 3.10 to 3.13
-
-Install through pip:
-
-```bash
-pip install qemu-memory-viewer
+```commandline
+./start_qemu_486_msdos_5.sh
 ```
 
+_in another window_
+```commandline
+./start_viewer.sh
+```
 
 ## Documentation
 
