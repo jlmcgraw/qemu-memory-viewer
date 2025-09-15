@@ -1,0 +1,144 @@
+[project]
+name = "qemu-memory-viewer"
+version = "0.1.0"
+description = "A vibe-coded attempt to display RAM of a running QEMU emulation of a 486 with 1 MB of memory running DOS"
+authors = [
+    {name = "Jesse McGraw", email ="jlmcgraw@gmail.com"},
+]
+readme = "README.md"
+license-files = ["LICENSE.md"]
+
+requires-python = ">=3.10, ~=3.13"
+dependencies = []
+
+
+[project.urls]
+homepage = "https://github.com/jlmcgraw/qemu-memory-viewer"
+source = "https://github.com/jlmcgraw/qemu-memory-viewer"
+changelog = "https://github.com/jlmcgraw/qemu-memory-viewer/blob/main/CHANGELOG.md"
+
+
+[dependency-groups]
+dev = [
+    "basedpyright",
+    "ipython",
+    "mkdocs-material",
+    "mkdocstrings[python]",
+    "mypy",
+    "pyclean",
+    "pygments",
+    "pytest",
+    "pytest-cov",
+    "pytest-pretty",
+    "pytest-random-order",
+    "ruff",
+    "typos"
+]
+
+
+[tool.uv]
+package = true
+
+
+[tool.pytest.ini_options]
+addopts = [
+    "--random-order",
+    "--cov=src/qemu_memory_viewer",
+    "--cov-report=term-missing",
+    "--cov-fail-under=85",
+    "--cov-report=xml:.coverage.xml",
+    "--junitxml=.junit.xml",
+    "--override-ini=junit_family=legacy",
+]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 88
+indent-width = 4
+src = ["src/qemu_memory_viewer", "tests"]
+
+
+[tool.ruff.format]
+docstring-code-format = true
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+docstring-code-line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "F", # pyflakes
+    "E", # pycodestyle
+    "W", # whitespace and newlines
+    "I", # isort
+    "UP", # modernize
+    "ANN", # flake8 type annotations
+    "S", # flake8 bandit
+    "B", # flake8 bugbear
+    "C4", # flake8 comprehensions
+    "COM", # flake8 commas
+    "T20", # flake8 print
+    "SIM", # flake8 simplify
+    "ARG", # flake8 unused arguments
+    "DTZ", # flake8 datetimes
+    "Q", # flake8 quotes
+    "TCH", # flake8 typecheck
+    "D", # pydocstyle
+    "RUF", # ruff-specific rules
+]
+fixable = ["ALL"]
+ignore = [
+    "D203", "D205", "D213", "D215", "D400", "D401", "D404", "D406",
+    "D407", "D408", "D409", "D413",
+    "COM812",
+    "T201",
+    "I001"
+]
+
+[tool.ruff.lint.per-file-ignores]
+"test*" = ["D", "ANN", "S"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+
+[tool.mypy]
+pretty = true
+files = ["src/qemu_memory_viewer", "tests"]
+check_untyped_defs = true
+
+python_version = "3.13"
+strict = true
+
+disallow_any_unimported = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+show_error_codes = true
+warn_return_any = true
+warn_unreachable = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = []
+ignore_missing_imports = true
+
+
+[tool.basedpyright]
+reportAny = false
+reportExplicitAny = false
+reportUnusedCallResult = false
+
+
+[tool.typos.default]
+extend-ignore-identifiers-re = []
+
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qemu_memory_viewer"]
+
+[tool.coverage.run]
+source = ["src"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
