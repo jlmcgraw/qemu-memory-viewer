@@ -125,12 +125,21 @@ class QMP:
         raise RuntimeError(f"HMP error: {resp}")
 
 
-HEX2 = re.compile(r"\b([0-9a-fA-F]{2})\b")
+HEX_BYTE = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{2})(?![0-9a-fA-F])")
+
+
+def _extract_hex_bytes(text: str, limit: int) -> List[int]:
+    vals: List[int] = []
+    for match in HEX_BYTE.finditer(text):
+        vals.append(int(match.group(1), 16))
+        if len(vals) >= limit:
+            break
+    return vals
 
 
 def qmp_read_b800(q: QMP) -> np.ndarray:
     txt = q.hmp(f"xp /{VGA_TEXT_BYTES}bx {VGA_TEXT_BASE}")
-    vals = [int(m.group(1), 16) for m in HEX2.finditer(txt)]
+    vals = _extract_hex_bytes(txt, VGA_TEXT_BYTES)
     if len(vals) < VGA_TEXT_BYTES:
         vals += [0] * (VGA_TEXT_BYTES - len(vals))
     arr = np.frombuffer(bytearray(vals[:VGA_TEXT_BYTES]), dtype=np.uint8)
