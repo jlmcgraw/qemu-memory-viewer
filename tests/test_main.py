@@ -168,3 +168,47 @@ def test_build_mapping_overlay_data_skips_system_ram_label() -> None:
 
     assert qmp.commands == []
     assert not any(mask.tolist())
+
+
+def test_apply_overlay_block_prefers_overlay_bytes() -> None:
+    base_values = [[row * 4 + col for col in range(4)] for row in range(4)]
+    base = main.np.asarray(base_values, dtype=main.np.uint8)
+    overlay = main.np.asarray(
+        [[0xAA for _ in range(4)] for _ in range(4)],
+        dtype=main.np.uint8,
+    )
+    mask = main.np.asarray(
+        [
+            [0, 0, 0, 0],
+            [0, 1, 1, 0],
+            [0, 1, 1, 0],
+            [0, 0, 0, 0],
+        ],
+        dtype=main.np.uint8,
+    )
+
+    merged = main.apply_overlay_block(base, overlay, mask)
+
+    assert merged.shape == base.shape
+    assert merged.dtype == base.dtype
+    assert merged[1, 1] == 0xAA
+    assert merged[2, 2] == 0xAA
+    assert merged[0, 0] == base_values[0][0]
+    assert base.tolist() == [value for row in base_values for value in row]
+
+
+def test_apply_overlay_block_returns_base_when_mask_empty() -> None:
+    base_values = [[row * 3 + col for col in range(3)] for row in range(3)]
+    base = main.np.asarray(base_values, dtype=main.np.uint8)
+    overlay = main.np.asarray(
+        [[0x11 for _ in range(3)] for _ in range(3)],
+        dtype=main.np.uint8,
+    )
+    mask = main.np.asarray(
+        [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
+        dtype=main.np.uint8,
+    )
+
+    merged = main.apply_overlay_block(base, overlay, mask)
+
+    assert merged.tolist() == base.tolist()

@@ -384,6 +384,59 @@ def build_mapping_overlay_data(
     return data, mask
 
 
+def apply_overlay_block(
+    base_block: np.ndarray,
+    overlay_block: Optional[np.ndarray],
+    overlay_mask_block: Optional[np.ndarray],
+) -> np.ndarray:
+    """Return ``base_block`` with overlay bytes applied where available."""
+
+    base_arr = np.asarray(base_block)
+    if overlay_block is None or overlay_mask_block is None:
+        return base_arr
+
+    overlay_arr = np.asarray(overlay_block)
+    mask_arr = np.asarray(overlay_mask_block)
+
+    if base_arr.shape != overlay_arr.shape:
+        try:
+            overlay_arr = overlay_arr.reshape(base_arr.shape)
+        except Exception:
+            return base_arr
+    if base_arr.shape != mask_arr.shape:
+        try:
+            mask_arr = mask_arr.reshape(base_arr.shape)
+        except Exception:
+            return base_arr
+
+    def mask_any(obj: object) -> bool:
+        try:
+            length = len(obj)  # type: ignore[arg-type]
+        except Exception:
+            return bool(obj)
+        for idx in range(length):
+            if mask_any(obj[idx]):  # type: ignore[index]
+                return True
+        return False
+
+    if not mask_any(mask_arr):
+        return base_arr
+
+    def composite(base_obj: object, overlay_obj: object, mask_obj: object) -> object:
+        try:
+            length = len(base_obj)  # type: ignore[arg-type]
+        except Exception:
+            return int(overlay_obj) if bool(mask_obj) else int(base_obj)
+
+        return [
+            composite(base_obj[idx], overlay_obj[idx], mask_obj[idx])  # type: ignore[index]
+            for idx in range(length)
+        ]
+
+    combined = composite(base_arr, overlay_arr, mask_arr)
+    return np.asarray(combined, dtype=np.uint8)
+
+
 def render_vga_text(chars_attrs: np.ndarray, font: "ImageFont.FreeTypeFont") -> np.ndarray:
     try:
         from PIL import Image, ImageDraw
@@ -528,6 +581,20 @@ def main() -> None:
             rows = rows[:height]
         return rows
 
+    def magnifier_block_at(sx: int, sy: int) -> np.ndarray:
+        base_block = full[sy : sy + PANEL_SIZE, sx : sx + PANEL_SIZE]
+        overlay_block = (
+            mapping_data_full[sy : sy + PANEL_SIZE, sx : sx + PANEL_SIZE]
+            if mapping_data_full is not None
+            else None
+        )
+        mask_block = (
+            mapping_data_mask_full[sy : sy + PANEL_SIZE, sx : sx + PANEL_SIZE]
+            if mapping_data_mask_full is not None
+            else None
+        )
+        return apply_overlay_block(base_block, overlay_block, mask_block)
+
     def refresh_axes() -> None:
         nonlocal guide_lines, need_axes_refresh
         for ln in guide_lines:
@@ -613,7 +680,7 @@ def main() -> None:
 
     sx0 = clamp(sel_cx - PANEL_SIZE // 2, 0, args.width - PANEL_SIZE)
     sy0 = clamp(sel_cy - PANEL_SIZE // 2, 0, args.height - PANEL_SIZE)
-    block0 = full[sy0:sy0 + PANEL_SIZE, sx0:sx0 + PANEL_SIZE]
+    block0 = magnifier_block_at(sx0, sy0)
     im_mag = ax_mag.imshow(
         render_text_panel(block0, font_small),
         cmap="gray", vmin=0, vmax=255, interpolation="nearest", origin="upper"
@@ -662,6 +729,9 @@ def main() -> None:
                     interpolation="nearest",
                     origin="upper",
                     zorder=im.get_zorder() + 0.05,
+                )
+                im_mag.set_data(
+                    render_text_panel(magnifier_block_at(sx0, sy0), font_small)
                 )
 
             color_entries = [(0.0, 0.0, 0.0, 0.0)]
@@ -803,7 +873,7 @@ def main() -> None:
         rect.set_width(PANEL_SIZE)
         rect.set_height(PANEL_SIZE)
 
-        im_mag.set_data(render_text_panel(full[sy:sy + PANEL_SIZE, sx:sx + PANEL_SIZE], font_small))
+        im_mag.set_data(render_text_panel(magnifier_block_at(sx, sy), font_small))
 
         try:
             vga = qmp_read_b800(qmp)
