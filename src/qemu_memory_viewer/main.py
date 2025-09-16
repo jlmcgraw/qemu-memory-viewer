@@ -11,7 +11,8 @@ import json
 import os
 import re
 import socket
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 try:  # pragma: no cover - exercised when numpy is available
     import numpy as np
@@ -41,7 +42,6 @@ for b in range(256):
     if (0x00 <= b <= 0x1F) or b == 0x7F:
         ch = "."
     _CP437.append(ch)
-
 
 def clamp(v: int, lo: int, hi: int) -> int:
     return lo if v < lo else hi if v > hi else v
@@ -146,6 +146,25 @@ class QMP:
 
 
 HEX_BYTE = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{2})(?![0-9a-fA-F])")
+REG_TOKEN = re.compile(r"([A-Za-z][A-Za-z0-9_]*)=([0-9A-Fa-f]+)")
+SEGMENT_LINE = re.compile(
+    r"^(?P<seg>[A-Za-z]{2})\s*=\s*(?P<selector>[0-9A-Fa-f]{1,4})\s+(?P<base>[0-9A-Fa-f]{8,16})"
+)
+
+
+@dataclass(frozen=True)
+class RegisterPointerSpec:
+    """Description of a register-backed pointer to plot on the memory map."""
+
+    label: str
+    offset_keys: Sequence[str]
+    segment: Optional[str] = None
+    color: str = "cyan"
+
+
+POINTER_SPECS: Tuple[RegisterPointerSpec, ...] = (
+    RegisterPointerSpec(label="IP", offset_keys=("RIP", "EIP", "IP"), segment="CS", color="#00d7ff"),
+)
 
 
 def _extract_hex_bytes(text: str, limit: int) -> List[int]:
@@ -155,6 +174,46 @@ def _extract_hex_bytes(text: str, limit: int) -> List[int]:
         if len(vals) >= limit:
             break
     return vals
+
+
+def parse_register_dump(text: str) -> Dict[str, int]:
+    registers: Dict[str, int] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        for name, value in REG_TOKEN.findall(stripped):
+            registers[name.upper()] = int(value, 16)
+        seg_match = SEGMENT_LINE.match(stripped)
+        if seg_match:
+            seg = seg_match.group("seg").upper()
+            selector = int(seg_match.group("selector"), 16)
+            base = int(seg_match.group("base"), 16)
+            registers.setdefault(seg, selector)
+            registers[f"{seg}_BASE"] = base
+    return registers
+
+
+def compute_pointer_address(registers: Dict[str, int], spec: RegisterPointerSpec) -> Optional[int]:
+    offset: Optional[int] = None
+    for key in spec.offset_keys:
+        key_upper = key.upper()
+        if key_upper in registers:
+            offset = registers[key_upper]
+            break
+    if offset is None:
+        return None
+
+    if spec.segment is None:
+        return offset
+
+    seg_name = spec.segment.upper()
+    base = registers.get(f"{seg_name}_BASE")
+    if base is None and seg_name in registers:
+        base = registers[seg_name] << 4
+    if base is None:
+        return None
+    return base + offset
 
 
 def qmp_read_b800(q: QMP) -> np.ndarray:
@@ -287,6 +346,32 @@ def main() -> None:
     rect = patches.Rectangle((0, 0), PANEL_SIZE, PANEL_SIZE, linewidth=1.2, edgecolor="red", facecolor="none")
     ax.add_patch(rect)
 
+    pointer_artists: List[Tuple[RegisterPointerSpec, object, object]] = []
+    for spec in POINTER_SPECS:
+        marker_line, = ax.plot(
+            [], [],
+            marker="o",
+            markersize=8,
+            markerfacecolor="none",
+            markeredgecolor=spec.color,
+            markeredgewidth=1.5,
+            linestyle="none",
+        )
+        label_text = ax.text(
+            0,
+            0,
+            spec.label,
+            color=spec.color,
+            fontsize=9,
+            fontweight="bold",
+            ha="left",
+            va="bottom",
+            bbox=dict(facecolor=(0.0, 0.0, 0.0, 0.6), edgecolor="none", pad=1.5),
+        )
+        marker_line.set_visible(False)
+        label_text.set_visible(False)
+        pointer_artists.append((spec, marker_line, label_text))
+
     font_small = pick_mono_font(13)
     font_vga = pick_mono_font(14)
 
@@ -307,6 +392,39 @@ def main() -> None:
     im_vga = ax_vga.imshow(render_vga_text(vga0, font_vga), interpolation="nearest", origin="upper")
 
     refresh_axes()
+
+    register_state: Dict[str, int] = {}
+
+    def update_pointer_plot(registers: Dict[str, int]) -> None:
+        for spec, marker_line, label_text in pointer_artists:
+            addr = compute_pointer_address(registers, spec) if registers else None
+            if addr is None or not (0 <= addr < pixels):
+                marker_line.set_visible(False)
+                label_text.set_visible(False)
+                continue
+
+            gx = addr % args.width
+            gy = addr // args.width
+            if not (vx0 <= gx < vx0 + vW and vy0 <= gy < vy0 + vH):
+                marker_line.set_visible(False)
+                label_text.set_visible(False)
+                continue
+
+            lx = gx - vx0
+            ly = gy - vy0
+            marker_line.set_data([lx], [ly])
+            marker_line.set_visible(True)
+
+            label_x = float(clamp(int(round(lx + 2)), 0, max(0, vW - 1)))
+            label_y = float(clamp(int(round(ly + 2)), 0, max(0, vH - 1)))
+            label_text.set_position((label_x, label_y))
+            label_text.set_visible(True)
+
+    try:
+        register_state = parse_register_dump(qmp.hmp("info registers"))
+    except Exception:
+        pass
+    update_pointer_plot(register_state)
 
     def on_key(event):
         nonlocal vx0, vy0, vW, vH, need_axes_refresh, sel_cx, sel_cy
@@ -352,7 +470,7 @@ def main() -> None:
     cid_m = fig.canvas.mpl_connect("motion_notify_event", on_move)
 
     def update(_):
-        nonlocal need_axes_refresh
+        nonlocal need_axes_refresh, register_state
         im.set_data(view_slice())
         if need_axes_refresh:
             refresh_axes()
@@ -374,7 +492,19 @@ def main() -> None:
         except Exception:
             pass
 
-        return (im, im_mag, im_vga, rect)
+        try:
+            reg_txt = qmp.hmp("info registers")
+        except Exception:
+            pass
+        else:
+            register_state = parse_register_dump(reg_txt)
+
+        update_pointer_plot(register_state)
+
+        artists = [im, im_mag, im_vga, rect]
+        for _, marker_line, label_text in pointer_artists:
+            artists.extend((marker_line, label_text))
+        return tuple(artists)
 
     interval_ms = int(1000 / max(1, args.fps))
     anim = FuncAnimation(fig, update, interval=interval_ms, blit=False, cache_frame_data=False)
