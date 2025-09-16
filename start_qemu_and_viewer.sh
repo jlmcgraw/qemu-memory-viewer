@@ -48,7 +48,7 @@ command -v python3 >/dev/null 2>&1 || {
 if [[ ! -f "${VIEWER_SCRIPT}" ]]; then
   echo "Error: viewer script not found at ${VIEWER_SCRIPT}" >&2
   exit 1
-}
+fi
 
 if [[ -n "${QEMU_DISK_IMAGE}" ]]; then
   if [[ ! -f "${QEMU_DISK_IMAGE}" ]]; then
