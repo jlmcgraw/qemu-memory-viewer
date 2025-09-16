@@ -61,3 +61,37 @@ def test_qmp_read_b800_pads_to_expected_size() -> None:
     assert tuple(result[0, 1]) == (0x42, 0x17)
     # The helper should pad missing bytes with zeros so that the reshape always works
     assert tuple(result[0, 2]) == (0, 0)
+
+
+def test_parse_memory_mappings_extracts_alias_and_labels() -> None:
+    sample = """
+address-space: memory
+  0000000000000000-0000000000000fff (prio 0, RWX): alias = system_ram @ 0x0
+  0x0000000000001000-0x0000000000001fff (prio 0, RW): VGA region
+"""
+
+    mappings = main.parse_memory_mappings(sample)
+
+    assert len(mappings) == 2
+    assert mappings[0].start == 0x0
+    assert mappings[0].end == 0xFFF
+    assert mappings[0].label == "system_ram"
+    assert mappings[1].start == 0x1000
+    assert mappings[1].end == 0x1FFF
+    assert mappings[1].label == "VGA region"
+
+
+def test_build_mapping_mask_limits_ranges_to_available_bytes() -> None:
+    mappings = [
+        main.MemoryMapping(start=0, end=3, label="low"),
+        main.MemoryMapping(start=8, end=15, label="mid"),
+        main.MemoryMapping(start=32, end=64, label="high"),
+    ]
+
+    mask, visible = main.build_mapping_mask(mappings, total_bytes=16)
+
+    assert mask.shape == (16,)
+    assert len(visible) == 2
+    assert mask[:4].tolist() == [1, 1, 1, 1]
+    assert mask[4:8].tolist() == [0, 0, 0, 0]
+    assert mask[8:16].tolist() == [2] * 8

@@ -150,6 +150,8 @@ REG_TOKEN = re.compile(r"([A-Za-z][A-Za-z0-9_]*)=([0-9A-Fa-f]+)")
 SEGMENT_LINE = re.compile(
     r"^(?P<seg>[A-Za-z]{2})\s*=\s*(?P<selector>[0-9A-Fa-f]{1,4})\s+(?P<base>[0-9A-Fa-f]{8,16})"
 )
+MAP_RANGE = re.compile(r"(?:0x)?([0-9A-Fa-f]+)\s*-\s*(?:0x)?([0-9A-Fa-f]+)")
+ALIAS_TOKEN = re.compile(r"alias(?:\s+\w+)?\s*=\s*([^@]+)")
 
 
 @dataclass(frozen=True)
@@ -160,6 +162,19 @@ class RegisterPointerSpec:
     offset_keys: Sequence[str]
     segment: Optional[str] = None
     color: str = "cyan"
+
+
+@dataclass(frozen=True)
+class MemoryMapping:
+    """Description of a memory range reported by QEMU."""
+
+    start: int
+    end: int
+    label: str
+
+    @property
+    def size(self) -> int:
+        return self.end - self.start + 1
 
 
 POINTER_SPECS: Tuple[RegisterPointerSpec, ...] = (
@@ -192,6 +207,73 @@ def parse_register_dump(text: str) -> Dict[str, int]:
             registers.setdefault(seg, selector)
             registers[f"{seg}_BASE"] = base
     return registers
+
+
+def parse_memory_mappings(text: str) -> List[MemoryMapping]:
+    mappings: List[MemoryMapping] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.lower().startswith("address-space"):
+            continue
+        range_match = MAP_RANGE.search(line)
+        if not range_match:
+            continue
+        start_hex, end_hex = range_match.groups()
+        try:
+            start = int(start_hex, 16)
+            end = int(end_hex, 16)
+        except ValueError:
+            continue
+        if end < start:
+            start, end = end, start
+
+        rest = line[range_match.end():].strip()
+        if rest.startswith("("):
+            depth = 0
+            idx = 0
+            for idx, ch in enumerate(rest):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        idx += 1
+                        break
+            rest = rest[idx:].strip()
+        if rest.startswith(":"):
+            rest = rest[1:].strip()
+        alias_match = ALIAS_TOKEN.search(rest)
+        label = alias_match.group(1).strip() if alias_match else rest
+        if not label:
+            label = "mapping"
+        if "@" in label:
+            label = label.split("@", 1)[0].strip()
+        label = label.strip("\"'")
+        mappings.append(MemoryMapping(start=start, end=end, label=label or "mapping"))
+    return mappings
+
+
+def build_mapping_mask(mappings: Sequence[MemoryMapping], total_bytes: int) -> Tuple[np.ndarray, List[MemoryMapping]]:
+    normalized_total = max(0, int(total_bytes))
+    mask_list = [0] * normalized_total
+    visible: List[MemoryMapping] = []
+    if normalized_total <= 0:
+        return np.asarray(mask_list, dtype=np.uint8), visible
+
+    max_index = normalized_total - 1
+    idx = 1
+    for mapping in mappings:
+        start = max(0, int(mapping.start))
+        end = min(int(mapping.end), max_index)
+        if end < start or start > max_index or end < 0:
+            continue
+        if idx >= 255:
+            break
+        span = end - start + 1
+        mask_list[start:end + 1] = [idx] * span
+        visible.append(mapping)
+        idx += 1
+    return np.asarray(mask_list, dtype=np.uint8), visible
 
 
 def compute_pointer_address(registers: Dict[str, int], spec: RegisterPointerSpec) -> Optional[int]:
@@ -256,6 +338,7 @@ def render_vga_text(chars_attrs: np.ndarray, font: "ImageFont.FreeTypeFont") -> 
 def main() -> None:
     try:
         import matplotlib.pyplot as plt
+        from matplotlib import colors as mcolors
         from matplotlib import patches
         from matplotlib.animation import FuncAnimation
     except ModuleNotFoundError as exc:  # pragma: no cover - viewer path only
@@ -277,6 +360,11 @@ def main() -> None:
 
     mm = np.memmap(args.path, dtype=np.uint8, mode="r")
     full = mm[:pixels].reshape(args.height, args.width)
+
+    mapping_mask_full: Optional[np.ndarray] = None
+    mapping_overlay_im = None
+    mapping_legend = None
+    mapping_visible: List[MemoryMapping] = []
 
     vx0, vy0 = 0, 0
     vW, vH = args.width, args.height
@@ -391,6 +479,54 @@ def main() -> None:
         vga0 = np.zeros((VGA_ROWS, VGA_COLS, 2), dtype=np.uint8)
     im_vga = ax_vga.imshow(render_vga_text(vga0, font_vga), interpolation="nearest", origin="upper")
 
+    raw_mappings: List[MemoryMapping] = []
+    for cmd in ("info mem", "info mtree"):
+        try:
+            mapping_text = qmp.hmp(cmd)
+        except Exception:
+            continue
+        raw_mappings = parse_memory_mappings(mapping_text)
+        if raw_mappings:
+            break
+
+    if raw_mappings:
+        mask_flat, mapping_visible = build_mapping_mask(raw_mappings, pixels)
+        if mapping_visible:
+            mapping_mask_full = mask_flat.reshape(args.height, args.width)
+            color_entries = [(0.0, 0.0, 0.0, 0.0)]
+            base_cmap = plt.get_cmap("tab10")
+            for idx in range(len(mapping_visible)):
+                r, g, b, _ = base_cmap(idx % base_cmap.N)
+                color_entries.append((r, g, b, 0.35))
+            overlay_cmap = mcolors.ListedColormap(color_entries, name="mapped_memory")
+            overlay_norm = mcolors.BoundaryNorm(np.arange(len(color_entries) + 1) - 0.5, len(color_entries))
+            mapping_overlay_im = ax.imshow(
+                mapping_mask_full[vy0:vy0 + vH, vx0:vx0 + vW],
+                cmap=overlay_cmap,
+                norm=overlay_norm,
+                interpolation="nearest",
+                origin="upper",
+                zorder=im.get_zorder() + 0.1,
+            )
+            legend_handles: List[patches.Patch] = []
+            for idx, mapping in enumerate(mapping_visible, start=1):
+                rgba = overlay_cmap(idx)
+                handle = patches.Patch(
+                    facecolor=rgba,
+                    edgecolor=(rgba[0], rgba[1], rgba[2], min(1.0, rgba[3] + 0.2)),
+                    label=f"{mapping.label} ({mapping.start:06X}-{mapping.end:06X})",
+                )
+                legend_handles.append(handle)
+            if legend_handles:
+                mapping_legend = ax.legend(
+                    handles=legend_handles,
+                    loc="upper left",
+                    fontsize=8,
+                    framealpha=0.6,
+                    title="Mapped memory",
+                )
+                mapping_legend.set_zorder(mapping_overlay_im.get_zorder() + 0.1)
+
     refresh_axes()
 
     register_state: Dict[str, int] = {}
@@ -472,6 +608,9 @@ def main() -> None:
     def update(_):
         nonlocal need_axes_refresh, register_state
         im.set_data(view_slice())
+        if mapping_overlay_im is not None and mapping_mask_full is not None:
+            mapping_overlay_im.set_data(mapping_mask_full[vy0:vy0 + vH, vx0:vx0 + vW])
+            mapping_overlay_im.set_extent((-0.5, vW - 0.5, vH - 0.5, -0.5))
         if need_axes_refresh:
             refresh_axes()
 
@@ -501,7 +640,10 @@ def main() -> None:
 
         update_pointer_plot(register_state)
 
-        artists = [im, im_mag, im_vga, rect]
+        artists = [im]
+        if mapping_overlay_im is not None:
+            artists.append(mapping_overlay_im)
+        artists.extend([im_mag, im_vga, rect])
         for _, marker_line, label_text in pointer_artists:
             artists.extend((marker_line, label_text))
         return tuple(artists)
