@@ -463,12 +463,35 @@ def main() -> None:
     def flatten_array(arr: Optional[np.ndarray]) -> List[int]:
         if arr is None:
             return []
-        if hasattr(arr, "tolist"):
+
+        source = arr
+        if hasattr(source, "tolist"):
             try:
-                return list(arr.tolist())
+                source = source.tolist()
             except TypeError:
-                pass
-        return list(arr)
+                # Fall back to iterating over the original object when ``tolist``
+                # is not supported (e.g. compatibility shims).
+                source = arr
+
+        flat: List[int] = []
+        stack = [source]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, (list, tuple)):
+                # ``tolist`` on real numpy arrays returns nested lists for each
+                # dimension.  Iterate depth-first to preserve the original order
+                # when flattening.
+                stack.extend(reversed(item))
+                continue
+            try:
+                flat.append(int(item))
+            except Exception:
+                # ``bool`` provides a safe fallback for values that are not
+                # directly castable to ``int`` (e.g. numpy scalar proxies).
+                flat.append(int(bool(item)))
+
+        flat.reverse()
+        return flat
 
     def mask_has_values(arr: Optional[np.ndarray]) -> bool:
         return any(bool(v) for v in flatten_array(arr))
@@ -477,19 +500,32 @@ def main() -> None:
         flat = flatten_array(arr)
         shape = getattr(arr, "shape", ())
         if len(shape) >= 2:
-            width = int(shape[1]) if shape[1] else max(1, len(flat))
-        elif shape:
-            width = int(shape[0]) if shape[0] else max(1, len(flat))
+            height, width = int(shape[0]), int(shape[1])
+        elif len(shape) == 1:
+            height, width = 1, int(shape[0])
         else:
-            width = max(1, len(flat))
+            width = len(flat)
+            height = 1 if width else 0
+
+        if width <= 0 or height < 0:
+            width = max(0, width)
+            height = max(0, height)
+            return [[True] * width for _ in range(height)]
+
         rows: List[List[bool]] = []
-        for idx in range(0, len(flat), width):
+        step = width if width > 0 else 1
+        for idx in range(0, len(flat), step):
             segment = flat[idx:idx + width]
             if len(segment) < width:
                 segment = segment + [0] * (width - len(segment))
             rows.append([not bool(val) for val in segment[:width]])
-        if not rows:
-            rows.append([True] * width)
+
+        if not rows and height > 0:
+            return [[True] * width for _ in range(height)]
+        if len(rows) < height:
+            rows.extend([[True] * width for _ in range(height - len(rows))])
+        elif len(rows) > height:
+            rows = rows[:height]
         return rows
 
     def refresh_axes() -> None:
