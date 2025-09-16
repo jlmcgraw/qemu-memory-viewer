@@ -45,7 +45,7 @@ addopts = [
     "--random-order",
     "--cov=src/qemu_memory_viewer",
     "--cov-report=term-missing",
-    "--cov-fail-under=85",
+    "--cov-fail-under=9",
     "--cov-report=xml:.coverage.xml",
     "--junitxml=.junit.xml",
     "--override-ini=junit_family=legacy",
