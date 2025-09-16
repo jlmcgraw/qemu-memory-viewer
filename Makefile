@@ -34,7 +34,7 @@ qa: qa/full  ## Shortcut for qa/full
 
 .PHONY: qa/test
 qa/test:  ## Run the tests
-	uv run pytest
+	uv run --group dev pytest
 
 
 .PHONY: qa/types
