@@ -497,7 +497,6 @@ def main() -> None:
     mapping_visible: List[MemoryMapping] = []
     mapping_data_full: Optional[np.ndarray] = None
     mapping_data_mask_full: Optional[np.ndarray] = None
-    mapping_data_im = None
 
     vx0, vy0 = 0, 0
     vW, vH = args.width, args.height
@@ -512,6 +511,15 @@ def main() -> None:
 
     def view_slice() -> np.ndarray:
         return full[vy0:vy0 + vH, vx0:vx0 + vW]
+
+    def view_slice_with_overlay() -> np.ndarray:
+        base_view = view_slice()
+        if mapping_data_full is None or mapping_data_mask_full is None:
+            return base_view
+
+        overlay_view = mapping_data_full[vy0:vy0 + vH, vx0:vx0 + vW]
+        mask_view = mapping_data_mask_full[vy0:vy0 + vH, vx0:vx0 + vW]
+        return apply_overlay_block(base_view, overlay_view, mask_view)
 
     def flatten_array(arr: Optional[np.ndarray]) -> List[int]:
         if arr is None:
@@ -548,38 +556,6 @@ def main() -> None:
 
     def mask_has_values(arr: Optional[np.ndarray]) -> bool:
         return any(bool(v) for v in flatten_array(arr))
-
-    def mask_rows_for_slice(arr: np.ndarray) -> List[List[bool]]:
-        flat = flatten_array(arr)
-        shape = getattr(arr, "shape", ())
-        if len(shape) >= 2:
-            height, width = int(shape[0]), int(shape[1])
-        elif len(shape) == 1:
-            height, width = 1, int(shape[0])
-        else:
-            width = len(flat)
-            height = 1 if width else 0
-
-        if width <= 0 or height < 0:
-            width = max(0, width)
-            height = max(0, height)
-            return [[True] * width for _ in range(height)]
-
-        rows: List[List[bool]] = []
-        step = width if width > 0 else 1
-        for idx in range(0, len(flat), step):
-            segment = flat[idx:idx + width]
-            if len(segment) < width:
-                segment = segment + [0] * (width - len(segment))
-            rows.append([not bool(val) for val in segment[:width]])
-
-        if not rows and height > 0:
-            return [[True] * width for _ in range(height)]
-        if len(rows) < height:
-            rows.extend([[True] * width for _ in range(height - len(rows))])
-        elif len(rows) > height:
-            rows = rows[:height]
-        return rows
 
     def magnifier_block_at(sx: int, sy: int) -> np.ndarray:
         base_block = full[sy : sy + PANEL_SIZE, sx : sx + PANEL_SIZE]
@@ -643,7 +619,14 @@ def main() -> None:
     ax_vga.set_title("VGA text @ B800:0000 (80×25)")
     ax_vga.set_axis_off()
 
-    im = ax.imshow(view_slice(), cmap="gray", vmin=0, vmax=255, interpolation="nearest", origin="upper")
+    im = ax.imshow(
+        view_slice_with_overlay(),
+        cmap="gray",
+        vmin=0,
+        vmax=255,
+        interpolation="nearest",
+        origin="upper",
+    )
     ax.set_title(f"{args.path} ({args.width}x{args.height})")
     ax.margins(0)
     rect = patches.Rectangle((0, 0), PANEL_SIZE, PANEL_SIZE, linewidth=1.2, edgecolor="red", facecolor="none")
@@ -716,20 +699,7 @@ def main() -> None:
             if data_flat is not None and data_mask_flat is not None and mask_has_values(data_mask_flat):
                 mapping_data_full = data_flat.reshape(args.height, args.width)
                 mapping_data_mask_full = data_mask_flat.reshape(args.height, args.width)
-                mask_slice = mapping_data_mask_full[vy0:vy0 + vH, vx0:vx0 + vW]
-                masked_initial = np.ma.masked_array(
-                    mapping_data_full[vy0:vy0 + vH, vx0:vx0 + vW],
-                    mask=mask_rows_for_slice(mask_slice),
-                )
-                mapping_data_im = ax.imshow(
-                    masked_initial,
-                    cmap="gray",
-                    vmin=0,
-                    vmax=255,
-                    interpolation="nearest",
-                    origin="upper",
-                    zorder=im.get_zorder() + 0.05,
-                )
+                im.set_data(view_slice_with_overlay())
                 im_mag.set_data(
                     render_text_panel(magnifier_block_at(sx0, sy0), font_small)
                 )
@@ -848,16 +818,7 @@ def main() -> None:
 
     def update(_):
         nonlocal need_axes_refresh, register_state
-        im.set_data(view_slice())
-        if (
-            mapping_data_im is not None
-            and mapping_data_full is not None
-            and mapping_data_mask_full is not None
-        ):
-            data_view = mapping_data_full[vy0:vy0 + vH, vx0:vx0 + vW]
-            mask_slice = mapping_data_mask_full[vy0:vy0 + vH, vx0:vx0 + vW]
-            mapping_data_im.set_data(np.ma.masked_array(data_view, mask=mask_rows_for_slice(mask_slice)))
-            mapping_data_im.set_extent((-0.5, vW - 0.5, vH - 0.5, -0.5))
+        im.set_data(view_slice_with_overlay())
         if mapping_overlay_im is not None and mapping_mask_full is not None:
             mapping_overlay_im.set_data(mapping_mask_full[vy0:vy0 + vH, vx0:vx0 + vW])
             mapping_overlay_im.set_extent((-0.5, vW - 0.5, vH - 0.5, -0.5))
@@ -891,8 +852,6 @@ def main() -> None:
         update_pointer_plot(register_state)
 
         artists = [im]
-        if mapping_data_im is not None:
-            artists.append(mapping_data_im)
         if mapping_overlay_im is not None:
             artists.append(mapping_overlay_im)
         artists.extend([im_mag, im_vga, rect])
