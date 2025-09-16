@@ -8,18 +8,14 @@
 _A vibe-coded attempt to dynamically display the contents of RAM for running QEMU emulations with small amounts of memory.
 I just thought it might be fun_
 
+[![screenshots](screenshots/img.png)]
 
 ## Super-quick Start
 - install qemu
 - Start the emulation
 
 ```commandline
-./start_qemu_486_msdos_5.sh
-```
-
-_in another window_
-```commandline
-./start_viewer.sh
+./start_qemu_and_viewer.sh
 ```
 
 ## Documentation
