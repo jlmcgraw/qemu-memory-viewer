@@ -4,14 +4,22 @@
 # dependencies = ["numpy", "matplotlib", "Pillow"]
 # ///
 
-import argparse, os, json, socket, re
-from typing import List, Tuple, Optional
+from __future__ import annotations
 
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-from matplotlib import patches, font_manager as fm
-from PIL import Image, ImageDraw, ImageFont
+import argparse
+import json
+import os
+import re
+import socket
+from typing import TYPE_CHECKING, List, Optional, Tuple
+
+try:  # pragma: no cover - exercised when numpy is available
+    import numpy as np
+except ModuleNotFoundError:  # pragma: no cover - fallback exercised in tests
+    from . import _compat_numpy as np
+
+if TYPE_CHECKING:  # pragma: no cover - typing helpers only
+    from PIL import ImageFont
 
 PANEL_SIZE = 64  # 64x64 “under cursor” byte window
 VGA_ROWS, VGA_COLS = 25, 80
@@ -49,11 +57,18 @@ def compute_marker_rows(markers_kib: List[int], full_width: int, full_height: in
     return rows
 
 
-def pick_mono_font(size: int = 13) -> ImageFont.FreeTypeFont:
+def pick_mono_font(size: int = 13) -> "ImageFont.FreeTypeFont":
+    try:
+        from matplotlib import font_manager as fm
+        from PIL import ImageFont
+    except ModuleNotFoundError as exc:  # pragma: no cover - exercised when optional deps missing
+        msg = "Font rendering requires both Pillow and Matplotlib"
+        raise RuntimeError(msg) from exc
+
     path = fm.findfont("DejaVu Sans Mono", fallback_to_default=True)
     try:
         return ImageFont.truetype(path, size=size)
-    except Exception:
+    except Exception:  # pragma: no cover - Pillow fallback path
         return ImageFont.load_default()
 
 
@@ -65,7 +80,12 @@ def bytes_to_cp437_lines(block: np.ndarray) -> List[str]:
     return lines
 
 
-def render_text_panel(block: np.ndarray, font: ImageFont.FreeTypeFont) -> np.ndarray:
+def render_text_panel(block: np.ndarray, font: "ImageFont.FreeTypeFont") -> np.ndarray:
+    try:
+        from PIL import Image, ImageDraw
+    except ModuleNotFoundError as exc:  # pragma: no cover - exercised when Pillow missing
+        raise RuntimeError("Rendering text panels requires Pillow") from exc
+
     lines = bytes_to_cp437_lines(block)
     try:
         l, t, r, b = font.getbbox("M")
@@ -146,7 +166,12 @@ def qmp_read_b800(q: QMP) -> np.ndarray:
     return arr.reshape(VGA_ROWS, VGA_COLS, 2)
 
 
-def render_vga_text(chars_attrs: np.ndarray, font: ImageFont.FreeTypeFont) -> np.ndarray:
+def render_vga_text(chars_attrs: np.ndarray, font: "ImageFont.FreeTypeFont") -> np.ndarray:
+    try:
+        from PIL import Image, ImageDraw
+    except ModuleNotFoundError as exc:  # pragma: no cover - exercised when Pillow missing
+        raise RuntimeError("Rendering VGA panels requires Pillow") from exc
+
     try:
         l, t, r, b = font.getbbox("M")
         cw = max(8, r - l)
@@ -170,6 +195,13 @@ def render_vga_text(chars_attrs: np.ndarray, font: ImageFont.FreeTypeFont) -> np
 # -------- Main viewer --------
 
 def main() -> None:
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib import patches
+        from matplotlib.animation import FuncAnimation
+    except ModuleNotFoundError as exc:  # pragma: no cover - viewer path only
+        raise RuntimeError("Matplotlib is required to run the viewer") from exc
+
     p = argparse.ArgumentParser(description="Live memory viewer with CP437 magnifier and VGA B800h panel")
     p.add_argument("path", help="RAM file path, e.g., /tmp/guest486.ram")
     p.add_argument("--width", type=int, default=1024, help="bytes per row in RAM view")
@@ -190,7 +222,7 @@ def main() -> None:
     vx0, vy0 = 0, 0
     vW, vH = args.width, args.height
     need_axes_refresh = True
-    guide_lines: List[plt.Line2D] = []
+    guide_lines: list = []
 
     sel_cx: Optional[int] = args.width // 2
     sel_cy: Optional[int] = args.height // 2

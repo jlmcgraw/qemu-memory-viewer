@@ -6,8 +6,11 @@ import tomllib
 
 
 def get_version_from_metadata() -> str:
-    """Return the version from metadata."""
-    return metadata.version(__package__ or __name__)
+    """Return the version from metadata, falling back to ``pyproject.toml``."""
+    try:
+        return metadata.version(__package__ or __name__)
+    except metadata.PackageNotFoundError:
+        return get_version_from_pyproject()
 
 
 def get_version_from_pyproject() -> str:
