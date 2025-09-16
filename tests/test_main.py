@@ -1,3 +1,5 @@
+import re
+
 import qemu_memory_viewer.main as main
 
 
@@ -9,6 +11,27 @@ class DummyQMP:
     def hmp(self, command: str) -> str:  # pragma: no cover - trivial
         self.commands.append(command)
         return self.response
+
+
+class DummyChunkQMP:
+    def __init__(self) -> None:
+        self.commands: list[str] = []
+
+    def hmp(self, command: str) -> str:
+        self.commands.append(command)
+        match = re.match(r"xp /(\d+)bx (0x)?([0-9A-Fa-f]+)", command)
+        assert match is not None
+        count = int(match.group(1))
+        addr_str = match.group(3)
+        base = int(addr_str, 16) if match.group(2) else int(addr_str)
+        values = [((base + i) & 0xFF) for i in range(count)]
+        lines: list[str] = []
+        for offset in range(0, count, 16):
+            chunk = values[offset : offset + 16]
+            addr = base + offset
+            bytes_text = " ".join(f"0x{val:02x}" for val in chunk)
+            lines.append(f"0x{addr:016x}: {bytes_text}")
+        return "\n".join(lines)
 
 
 def test_extract_hex_bytes_handles_varied_formats() -> None:
@@ -95,3 +118,53 @@ def test_build_mapping_mask_limits_ranges_to_available_bytes() -> None:
     assert mask[:4].tolist() == [1, 1, 1, 1]
     assert mask[4:8].tolist() == [0, 0, 0, 0]
     assert mask[8:16].tolist() == [2] * 8
+
+
+def test_qmp_read_bytes_reads_in_chunks() -> None:
+    qmp = DummyChunkQMP()
+
+    data = main.qmp_read_bytes(qmp, start=0x20, count=40, chunk_size=16)
+
+    assert qmp.commands == ["xp /16bx 0x20", "xp /16bx 0x30", "xp /8bx 0x40"]
+    assert data.tolist() == [((0x20 + i) & 0xFF) for i in range(40)]
+
+
+def test_build_mapping_overlay_data_reads_and_masks() -> None:
+    qmp = DummyChunkQMP()
+    mapping = main.MemoryMapping(start=0x20, end=0x3F, label="bios_rom")
+
+    data, mask = main.build_mapping_overlay_data(qmp, [mapping], total_bytes=128)
+
+    assert data.dtype == main.np.uint8
+    assert mask.dtype == main.np.uint8
+    expected = [((0x20 + i) & 0xFF) for i in range(32)]
+    assert data[mapping.start : mapping.end + 1].tolist() == expected
+    assert mask[mapping.start : mapping.end + 1].tolist() == [1] * 32
+
+
+def test_build_mapping_overlay_data_skips_large_ranges() -> None:
+    mapping = main.MemoryMapping(
+        start=0,
+        end=main.MAX_MAPPING_FETCH_BYTES,
+        label="huge_rom",
+    )
+    qmp = DummyQMP("unused")
+
+    data, mask = main.build_mapping_overlay_data(
+        qmp, [mapping], total_bytes=main.MAX_MAPPING_FETCH_BYTES + 1
+    )
+
+    assert data.shape == (main.MAX_MAPPING_FETCH_BYTES + 1,)
+    assert mask.shape == (main.MAX_MAPPING_FETCH_BYTES + 1,)
+    assert not any(mask.tolist())
+    assert qmp.commands == []
+
+
+def test_build_mapping_overlay_data_skips_system_ram_label() -> None:
+    mapping = main.MemoryMapping(start=0, end=63, label="system_ram")
+    qmp = DummyQMP("unused")
+
+    _, mask = main.build_mapping_overlay_data(qmp, [mapping], total_bytes=64)
+
+    assert qmp.commands == []
+    assert not any(mask.tolist())

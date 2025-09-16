@@ -26,6 +26,8 @@ PANEL_SIZE = 64  # 64x64 “under cursor” byte window
 VGA_ROWS, VGA_COLS = 25, 80
 VGA_TEXT_BASE = 0xB8000
 VGA_TEXT_BYTES = VGA_ROWS * VGA_COLS * 2  # char+attr
+MAPPING_FETCH_CHUNK = 256
+MAX_MAPPING_FETCH_BYTES = 512 * 1024
 
 # 16-color VGA palette (approx)
 VGA_RGB = [
@@ -307,6 +309,81 @@ def qmp_read_b800(q: QMP) -> np.ndarray:
     return arr.reshape(VGA_ROWS, VGA_COLS, 2)
 
 
+def qmp_read_bytes(q: QMP, start: int, count: int, chunk_size: int = MAPPING_FETCH_CHUNK) -> np.ndarray:
+    """Read a span of physical memory bytes via the QMP human monitor."""
+
+    normalized_count = max(0, int(count))
+    if normalized_count == 0:
+        return np.zeros(0, dtype=np.uint8)
+
+    chunk_len = max(1, int(chunk_size))
+    base = int(start)
+    buf = bytearray(normalized_count)
+    offset = 0
+    while offset < normalized_count:
+        step = min(chunk_len, normalized_count - offset)
+        addr = base + offset
+        txt = q.hmp(f"xp /{step}bx 0x{addr:X}")
+        vals = _extract_hex_bytes(txt, step)
+        if len(vals) < step:
+            vals.extend([0] * (step - len(vals)))
+        buf[offset : offset + step] = bytes(vals[:step])
+        offset += step
+    return np.frombuffer(buf, dtype=np.uint8)
+
+
+def build_mapping_overlay_data(
+    qmp: QMP, mappings: Sequence[MemoryMapping], total_bytes: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Collect raw bytes for selected mappings.
+
+    Returns a tuple of ``(data, mask)`` flattened to ``total_bytes`` entries. The mask
+    indicates which indices have valid overlay data.
+    """
+
+    normalized_total = max(0, int(total_bytes))
+    data_list = [0] * normalized_total
+    mask_list = [0] * normalized_total
+    if normalized_total == 0:
+        return np.asarray(data_list, dtype=np.uint8), np.asarray(mask_list, dtype=np.uint8)
+
+    for mapping in mappings:
+        start = max(0, int(mapping.start))
+        end = min(int(mapping.end), normalized_total - 1)
+        if end < start:
+            continue
+
+        span = end - start + 1
+        if span <= 0:
+            continue
+        label_lc = mapping.label.lower()
+        if span > MAX_MAPPING_FETCH_BYTES:
+            continue
+        if "system" in label_lc and "ram" in label_lc:
+            continue
+
+        try:
+            chunk = qmp_read_bytes(qmp, start, span, chunk_size=MAPPING_FETCH_CHUNK)
+        except Exception:
+            continue
+
+        if hasattr(chunk, "tolist"):
+            chunk_vals = chunk.tolist()
+        else:
+            chunk_vals = list(chunk)
+        if len(chunk_vals) < span:
+            chunk_vals.extend([0] * (span - len(chunk_vals)))
+        elif len(chunk_vals) > span:
+            chunk_vals = chunk_vals[:span]
+
+        data_list[start : end + 1] = chunk_vals
+        mask_list[start : end + 1] = [1] * span
+
+    data = np.asarray(data_list, dtype=np.uint8)
+    mask = np.asarray(mask_list, dtype=np.uint8)
+    return data, mask
+
+
 def render_vga_text(chars_attrs: np.ndarray, font: "ImageFont.FreeTypeFont") -> np.ndarray:
     try:
         from PIL import Image, ImageDraw
@@ -365,6 +442,9 @@ def main() -> None:
     mapping_overlay_im = None
     mapping_legend = None
     mapping_visible: List[MemoryMapping] = []
+    mapping_data_full: Optional[np.ndarray] = None
+    mapping_data_mask_full: Optional[np.ndarray] = None
+    mapping_data_im = None
 
     vx0, vy0 = 0, 0
     vW, vH = args.width, args.height
@@ -379,6 +459,38 @@ def main() -> None:
 
     def view_slice() -> np.ndarray:
         return full[vy0:vy0 + vH, vx0:vx0 + vW]
+
+    def flatten_array(arr: Optional[np.ndarray]) -> List[int]:
+        if arr is None:
+            return []
+        if hasattr(arr, "tolist"):
+            try:
+                return list(arr.tolist())
+            except TypeError:
+                pass
+        return list(arr)
+
+    def mask_has_values(arr: Optional[np.ndarray]) -> bool:
+        return any(bool(v) for v in flatten_array(arr))
+
+    def mask_rows_for_slice(arr: np.ndarray) -> List[List[bool]]:
+        flat = flatten_array(arr)
+        shape = getattr(arr, "shape", ())
+        if len(shape) >= 2:
+            width = int(shape[1]) if shape[1] else max(1, len(flat))
+        elif shape:
+            width = int(shape[0]) if shape[0] else max(1, len(flat))
+        else:
+            width = max(1, len(flat))
+        rows: List[List[bool]] = []
+        for idx in range(0, len(flat), width):
+            segment = flat[idx:idx + width]
+            if len(segment) < width:
+                segment = segment + [0] * (width - len(segment))
+            rows.append([not bool(val) for val in segment[:width]])
+        if not rows:
+            rows.append([True] * width)
+        return rows
 
     def refresh_axes() -> None:
         nonlocal guide_lines, need_axes_refresh
@@ -493,11 +605,34 @@ def main() -> None:
         mask_flat, mapping_visible = build_mapping_mask(raw_mappings, pixels)
         if mapping_visible:
             mapping_mask_full = mask_flat.reshape(args.height, args.width)
+
+            try:
+                data_flat, data_mask_flat = build_mapping_overlay_data(qmp, mapping_visible, pixels)
+            except Exception:
+                data_flat = data_mask_flat = None
+            if data_flat is not None and data_mask_flat is not None and mask_has_values(data_mask_flat):
+                mapping_data_full = data_flat.reshape(args.height, args.width)
+                mapping_data_mask_full = data_mask_flat.reshape(args.height, args.width)
+                mask_slice = mapping_data_mask_full[vy0:vy0 + vH, vx0:vx0 + vW]
+                masked_initial = np.ma.masked_array(
+                    mapping_data_full[vy0:vy0 + vH, vx0:vx0 + vW],
+                    mask=mask_rows_for_slice(mask_slice),
+                )
+                mapping_data_im = ax.imshow(
+                    masked_initial,
+                    cmap="gray",
+                    vmin=0,
+                    vmax=255,
+                    interpolation="nearest",
+                    origin="upper",
+                    zorder=im.get_zorder() + 0.05,
+                )
+
             color_entries = [(0.0, 0.0, 0.0, 0.0)]
             base_cmap = plt.get_cmap("tab10")
             for idx in range(len(mapping_visible)):
                 r, g, b, _ = base_cmap(idx % base_cmap.N)
-                color_entries.append((r, g, b, 0.35))
+                color_entries.append((r, g, b, 0.2))
             overlay_cmap = mcolors.ListedColormap(color_entries, name="mapped_memory")
             overlay_norm = mcolors.BoundaryNorm(np.arange(len(color_entries) + 1) - 0.5, len(color_entries))
             mapping_overlay_im = ax.imshow(
@@ -608,6 +743,15 @@ def main() -> None:
     def update(_):
         nonlocal need_axes_refresh, register_state
         im.set_data(view_slice())
+        if (
+            mapping_data_im is not None
+            and mapping_data_full is not None
+            and mapping_data_mask_full is not None
+        ):
+            data_view = mapping_data_full[vy0:vy0 + vH, vx0:vx0 + vW]
+            mask_slice = mapping_data_mask_full[vy0:vy0 + vH, vx0:vx0 + vW]
+            mapping_data_im.set_data(np.ma.masked_array(data_view, mask=mask_rows_for_slice(mask_slice)))
+            mapping_data_im.set_extent((-0.5, vW - 0.5, vH - 0.5, -0.5))
         if mapping_overlay_im is not None and mapping_mask_full is not None:
             mapping_overlay_im.set_data(mapping_mask_full[vy0:vy0 + vH, vx0:vx0 + vW])
             mapping_overlay_im.set_extent((-0.5, vW - 0.5, vH - 0.5, -0.5))
@@ -641,6 +785,8 @@ def main() -> None:
         update_pointer_plot(register_state)
 
         artists = [im]
+        if mapping_data_im is not None:
+            artists.append(mapping_data_im)
         if mapping_overlay_im is not None:
             artists.append(mapping_overlay_im)
         artists.extend([im_mag, im_vga, rect])
