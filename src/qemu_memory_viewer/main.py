@@ -560,6 +560,35 @@ def main() -> None:
         mask_view = mapping_data_mask_full[vy0:vy0 + vH, vx0:vx0 + vW]
         return apply_overlay_block(base_view, overlay_view, mask_view)
 
+    def flatten_array(arr: Optional[np.ndarray]) -> List[int]:
+        if arr is None:
+            return []
+
+        source = arr
+        if hasattr(source, "tolist"):
+            try:
+                source = source.tolist()
+            except TypeError:
+                source = arr
+
+        flat: List[int] = []
+        stack = [source]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, (list, tuple)):
+                stack.extend(reversed(item))
+                continue
+            try:
+                flat.append(int(item))
+            except Exception:
+                flat.append(int(bool(item)))
+
+        flat.reverse()
+        return flat
+
+    def mask_has_values(arr: Optional[np.ndarray]) -> bool:
+        return any(bool(v) for v in flatten_array(arr))
+
     def magnifier_block_at(sx: int, sy: int) -> np.ndarray:
         base_block = full[sy : sy + PANEL_SIZE, sx : sx + PANEL_SIZE]
         overlay_block = (
@@ -699,6 +728,16 @@ def main() -> None:
         mask_flat, mapping_visible = build_mapping_mask(overlay_mappings, pixels)
         if mapping_visible:
             mapping_mask_full = mask_flat.reshape(args.height, args.width)
+
+            try:
+                data_flat, data_mask_flat = build_mapping_overlay_data(qmp, mapping_visible, pixels)
+            except Exception:
+                data_flat = data_mask_flat = None
+            if data_flat is not None and data_mask_flat is not None and mask_has_values(data_mask_flat):
+                mapping_data_full = data_flat.reshape(args.height, args.width)
+                mapping_data_mask_full = data_mask_flat.reshape(args.height, args.width)
+                im.set_data(view_slice_with_overlay())
+                im_mag.set_data(render_text_panel(magnifier_block_at(sx0, sy0), font_small))
 
             color_entries = [(0.0, 0.0, 0.0, 0.0)]
             for mapping in mapping_visible:
