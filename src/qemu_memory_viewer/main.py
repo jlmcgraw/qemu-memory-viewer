@@ -507,7 +507,6 @@ def main() -> None:
 
     mapping_mask_full: Optional[np.ndarray] = None
     mapping_overlay_im = None
-    mapping_legend = None
     mapping_visible: List[MemoryMapping] = []
     mapping_data_full: Optional[np.ndarray] = None
     mapping_data_mask_full: Optional[np.ndarray] = None
@@ -615,10 +614,12 @@ def main() -> None:
         need_axes_refresh = True
 
     fig = plt.figure(figsize=(14, 6))
-    gs = fig.add_gridspec(nrows=1, ncols=3, width_ratios=[3, 2, 2])
+    gs = fig.add_gridspec(nrows=1, ncols=4, width_ratios=[3, 1.2, 2, 2])
     ax = fig.add_subplot(gs[0, 0])
-    ax_mag = fig.add_subplot(gs[0, 1])
-    ax_vga = fig.add_subplot(gs[0, 2])
+    ax_legend = fig.add_subplot(gs[0, 1])
+    ax_mag = fig.add_subplot(gs[0, 2])
+    ax_vga = fig.add_subplot(gs[0, 3])
+    ax_legend.set_axis_off()
     ax_mag.set_title(f"{PANEL_SIZE}×{PANEL_SIZE} CP437 bytes")
     ax_mag.set_axis_off()
     ax_vga.set_title("VGA text @ B800:0000 (80×25)")
@@ -724,14 +725,15 @@ def main() -> None:
                 )
                 legend_handles.append(handle)
             if legend_handles:
-                mapping_legend = ax.legend(
+                ax_legend.cla()
+                ax_legend.set_axis_off()
+                ax_legend.legend(
                     handles=legend_handles,
                     loc="upper left",
                     fontsize=8,
                     framealpha=0.65,
                     title="Memory layout",
                 )
-                mapping_legend.set_zorder(mapping_overlay_im.get_zorder() + 0.1)
 
     refresh_axes()
 
