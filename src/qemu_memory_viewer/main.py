@@ -4,16 +4,22 @@
 # dependencies = ["numpy", "matplotlib", "Pillow"]
 # ///
 
+"""Interactive viewer for inspecting QEMU guest memory."""
+
+# mypy: ignore-errors
+# pyright: reportGeneralTypeIssues=false
+
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import socket
 import sys
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING
 
 if __package__ in (None, ""):
     import importlib
@@ -26,7 +32,21 @@ else:  # pragma: no cover - exercised via unit tests
     from . import _compat_numpy as np
 
 if TYPE_CHECKING:  # pragma: no cover - typing helpers only
+    from collections.abc import Sequence
+    from typing import Protocol
+
+    from matplotlib.backend_bases import KeyEvent, MouseEvent
     from PIL import ImageFont
+
+    class HMPClient(Protocol):
+        """Protocol for objects that can issue human monitor commands."""
+
+        def hmp(self, command: str) -> str:
+            """Return the textual result of a human monitor command."""
+            ...
+
+
+logger = logging.getLogger(__name__)
 
 PANEL_SIZE = 64  # 64x64 “under cursor” byte window
 VGA_ROWS, VGA_COLS = 25, 80
@@ -37,29 +57,46 @@ MAX_MAPPING_FETCH_BYTES = 512 * 1024
 
 # 16-color VGA palette (approx)
 VGA_RGB = [
-    (0, 0, 0), (0, 0, 170), (0, 170, 0), (0, 170, 170),
-    (170, 0, 0), (170, 0, 170), (170, 85, 0), (170, 170, 170),
-    (85, 85, 85), (85, 85, 255), (85, 255, 85), (85, 255, 255),
-    (255, 85, 85), (255, 85, 255), (255, 255, 85), (255, 255, 255),
+    (0, 0, 0),
+    (0, 0, 170),
+    (0, 170, 0),
+    (0, 170, 170),
+    (170, 0, 0),
+    (170, 0, 170),
+    (170, 85, 0),
+    (170, 170, 170),
+    (85, 85, 85),
+    (85, 85, 255),
+    (85, 255, 85),
+    (85, 255, 255),
+    (255, 85, 85),
+    (255, 85, 255),
+    (255, 255, 85),
+    (255, 255, 255),
 ]
 
 # CP437 LUT
-_CP437: List[str] = []
+_CP437: list[str] = []
 for b in range(256):
     ch = bytes([b]).decode("cp437", errors="replace")
     if (0x00 <= b <= 0x1F) or b == 0x7F:
         ch = "."
     _CP437.append(ch)
 
+
 def clamp(v: int, lo: int, hi: int) -> int:
+    """Clamp ``v`` between ``lo`` and ``hi`` inclusive."""
     return lo if v < lo else hi if v > hi else v
 
 
-def pick_mono_font(size: int = 13) -> "ImageFont.FreeTypeFont":
+def pick_mono_font(size: int = 13) -> ImageFont.FreeTypeFont:
+    """Pick a monospaced font, falling back to the Pillow default."""
     try:
         from matplotlib import font_manager as fm
         from PIL import ImageFont
-    except ModuleNotFoundError as exc:  # pragma: no cover - exercised when optional deps missing
+    except (
+        ModuleNotFoundError
+    ) as exc:  # pragma: no cover - exercised when optional deps missing
         msg = "Font rendering requires both Pillow and Matplotlib"
         raise RuntimeError(msg) from exc
 
@@ -70,24 +107,28 @@ def pick_mono_font(size: int = 13) -> "ImageFont.FreeTypeFont":
         return ImageFont.load_default()
 
 
-def bytes_to_cp437_lines(block: np.ndarray) -> List[str]:
-    lines: List[str] = []
+def bytes_to_cp437_lines(block: np.ndarray) -> list[str]:
+    """Convert a CP437 encoded byte block into lines of text."""
+    lines: list[str] = []
     for y in range(PANEL_SIZE):
         row = block[y, :PANEL_SIZE]
         lines.append("".join(_CP437[int(v)] for v in row))
     return lines
 
 
-def render_text_panel(block: np.ndarray, font: "ImageFont.FreeTypeFont") -> np.ndarray:
+def render_text_panel(block: np.ndarray, font: ImageFont.FreeTypeFont) -> np.ndarray:
+    """Render a CP437 byte matrix to a grayscale image array."""
     try:
         from PIL import Image, ImageDraw
-    except ModuleNotFoundError as exc:  # pragma: no cover - exercised when Pillow missing
+    except (
+        ModuleNotFoundError
+    ) as exc:  # pragma: no cover - exercised when Pillow missing
         raise RuntimeError("Rendering text panels requires Pillow") from exc
 
     lines = bytes_to_cp437_lines(block)
     try:
-        l, t, r, b = font.getbbox("M")
-        cell_w = max(8, r - l)
+        left, _top, right, _bottom = font.getbbox("M")
+        cell_w = max(8, right - left)
         ascent, descent = font.getmetrics()
         cell_h = max(12, ascent + descent)
     except Exception:
@@ -103,13 +144,18 @@ def render_text_panel(block: np.ndarray, font: "ImageFont.FreeTypeFont") -> np.n
 
 # -------- QMP minimal client --------
 
+
 class QMP:
-    def __init__(self, path: str):
+    """Minimal client for interacting with the QEMU Machine Protocol."""
+
+    def __init__(self, path: str) -> None:
+        """Initialise the client for the UNIX socket at ``path``."""
         self.path = path
-        self.sock: Optional[socket.socket] = None
+        self.sock: socket.socket | None = None
         self.buf = b""
 
     def connect(self) -> None:
+        """Open the UNIX socket connection and negotiate capabilities."""
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.connect(self.path)
         self.sock = s
@@ -118,12 +164,16 @@ class QMP:
         self._recv_json()
 
     def _send_json(self, obj: dict) -> None:
-        assert self.sock is not None
+        """Send a JSON command over the QMP socket."""
+        if self.sock is None:
+            raise RuntimeError("QMP connection is not established")
         data = (json.dumps(obj) + "\r\n").encode("utf-8")
         self.sock.sendall(data)
 
     def _recv_json(self) -> dict:
-        assert self.sock is not None
+        """Receive a JSON response from the QMP socket."""
+        if self.sock is None:
+            raise RuntimeError("QMP connection is not established")
         while True:
             chunk = self.sock.recv(65536)
             if not chunk:
@@ -136,7 +186,10 @@ class QMP:
                 return json.loads(line.decode("utf-8"))
 
     def hmp(self, cmd: str) -> str:
-        self._send_json({"execute": "human-monitor-command", "arguments": {"command-line": cmd}})
+        """Execute a human monitor command and return its string response."""
+        self._send_json(
+            {"execute": "human-monitor-command", "arguments": {"command-line": cmd}}
+        )
         resp = self._recv_json()
         if "return" in resp:
             return str(resp["return"])
@@ -158,7 +211,7 @@ class RegisterPointerSpec:
 
     label: str
     offset_keys: Sequence[str]
-    segment: Optional[str] = None
+    segment: str | None = None
     color: str = "cyan"
 
 
@@ -172,6 +225,7 @@ class MemoryMapping:
 
     @property
     def size(self) -> int:
+        """Return the inclusive size of the mapping in bytes."""
         return self.end - self.start + 1
 
 
@@ -185,7 +239,7 @@ class DisplayRegion:
     color: str
 
 
-DISPLAY_REGIONS: Tuple[DisplayRegion, ...] = (
+DISPLAY_REGIONS: tuple[DisplayRegion, ...] = (
     DisplayRegion(0x00000000, 0x000003FF, "Interrupt Vector Table", "#f4cccc"),
     DisplayRegion(0x00000400, 0x000004FF, "BDA (BIOS Data Area)", "#fce5cd"),
     DisplayRegion(0x00000500, 0x00007BFF, "Conventional memory (usable)", "#fff2cc"),
@@ -199,13 +253,15 @@ DISPLAY_REGIONS: Tuple[DisplayRegion, ...] = (
 )
 
 
-POINTER_SPECS: Tuple[RegisterPointerSpec, ...] = (
-    RegisterPointerSpec(label="IP", offset_keys=("RIP", "EIP", "IP"), segment="CS", color="#00d7ff"),
+POINTER_SPECS: tuple[RegisterPointerSpec, ...] = (
+    RegisterPointerSpec(
+        label="IP", offset_keys=("RIP", "EIP", "IP"), segment="CS", color="#00d7ff"
+    ),
 )
 
 
-def _extract_hex_bytes(text: str, limit: int) -> List[int]:
-    vals: List[int] = []
+def _extract_hex_bytes(text: str, limit: int) -> list[int]:
+    vals: list[int] = []
     for match in HEX_BYTE.finditer(text):
         vals.append(int(match.group(1), 16))
         if len(vals) >= limit:
@@ -213,8 +269,9 @@ def _extract_hex_bytes(text: str, limit: int) -> List[int]:
     return vals
 
 
-def parse_register_dump(text: str) -> Dict[str, int]:
-    registers: Dict[str, int] = {}
+def parse_register_dump(text: str) -> dict[str, int]:
+    """Parse human monitor register output into a mapping of register names."""
+    registers: dict[str, int] = {}
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped:
@@ -231,8 +288,9 @@ def parse_register_dump(text: str) -> Dict[str, int]:
     return registers
 
 
-def parse_memory_mappings(text: str) -> List[MemoryMapping]:
-    mappings: List[MemoryMapping] = []
+def parse_memory_mappings(text: str) -> list[MemoryMapping]:
+    """Parse ``info mem`` output into structured :class:`MemoryMapping` entries."""
+    mappings: list[MemoryMapping] = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.lower().startswith("address-space"):
@@ -249,7 +307,7 @@ def parse_memory_mappings(text: str) -> List[MemoryMapping]:
         if end < start:
             start, end = end, start
 
-        rest = line[range_match.end():].strip()
+        rest = line[range_match.end() :].strip()
         if rest.startswith("("):
             depth = 0
             idx = 0
@@ -275,10 +333,13 @@ def parse_memory_mappings(text: str) -> List[MemoryMapping]:
     return mappings
 
 
-def build_mapping_mask(mappings: Sequence[MemoryMapping], total_bytes: int) -> Tuple[np.ndarray, List[MemoryMapping]]:
+def build_mapping_mask(
+    mappings: Sequence[MemoryMapping], total_bytes: int
+) -> tuple[np.ndarray, list[MemoryMapping]]:
+    """Build a mask array indicating which bytes belong to overlay mappings."""
     normalized_total = max(0, int(total_bytes))
     mask_list = [0] * normalized_total
-    visible: List[MemoryMapping] = []
+    visible: list[MemoryMapping] = []
     if normalized_total <= 0:
         return np.asarray(mask_list, dtype=np.uint8), visible
 
@@ -292,14 +353,17 @@ def build_mapping_mask(mappings: Sequence[MemoryMapping], total_bytes: int) -> T
         if idx >= 255:
             break
         span = end - start + 1
-        mask_list[start:end + 1] = [idx] * span
+        mask_list[start : end + 1] = [idx] * span
         visible.append(mapping)
         idx += 1
     return np.asarray(mask_list, dtype=np.uint8), visible
 
 
-def compute_pointer_address(registers: Dict[str, int], spec: RegisterPointerSpec) -> Optional[int]:
-    offset: Optional[int] = None
+def compute_pointer_address(
+    registers: dict[str, int], spec: RegisterPointerSpec
+) -> int | None:
+    """Resolve a pointer address for ``spec`` given the register state."""
+    offset: int | None = None
     for key in spec.offset_keys:
         key_upper = key.upper()
         if key_upper in registers:
@@ -320,7 +384,8 @@ def compute_pointer_address(registers: Dict[str, int], spec: RegisterPointerSpec
     return base + offset
 
 
-def qmp_read_b800(q: QMP) -> np.ndarray:
+def qmp_read_b800(q: HMPClient) -> np.ndarray:
+    """Fetch the VGA text buffer via the QMP human monitor."""
     txt = q.hmp(f"xp /{VGA_TEXT_BYTES}bx {VGA_TEXT_BASE}")
     vals = _extract_hex_bytes(txt, VGA_TEXT_BYTES)
     if len(vals) < VGA_TEXT_BYTES:
@@ -329,9 +394,10 @@ def qmp_read_b800(q: QMP) -> np.ndarray:
     return arr.reshape(VGA_ROWS, VGA_COLS, 2)
 
 
-def qmp_read_bytes(q: QMP, start: int, count: int, chunk_size: int = MAPPING_FETCH_CHUNK) -> np.ndarray:
+def qmp_read_bytes(
+    q: HMPClient, start: int, count: int, chunk_size: int = MAPPING_FETCH_CHUNK
+) -> np.ndarray:
     """Read a span of physical memory bytes via the QMP human monitor."""
-
     normalized_count = max(0, int(count))
     if normalized_count == 0:
         return np.zeros(0, dtype=np.uint8)
@@ -353,19 +419,20 @@ def qmp_read_bytes(q: QMP, start: int, count: int, chunk_size: int = MAPPING_FET
 
 
 def build_mapping_overlay_data(
-    qmp: QMP, mappings: Sequence[MemoryMapping], total_bytes: int
-) -> Tuple[np.ndarray, np.ndarray]:
+    qmp: HMPClient, mappings: Sequence[MemoryMapping], total_bytes: int
+) -> tuple[np.ndarray, np.ndarray]:
     """Collect raw bytes for selected mappings.
 
     Returns a tuple of ``(data, mask)`` flattened to ``total_bytes`` entries. The mask
     indicates which indices have valid overlay data.
     """
-
     normalized_total = max(0, int(total_bytes))
     data_list = [0] * normalized_total
     mask_list = [0] * normalized_total
     if normalized_total == 0:
-        return np.asarray(data_list, dtype=np.uint8), np.asarray(mask_list, dtype=np.uint8)
+        return np.asarray(data_list, dtype=np.uint8), np.asarray(
+            mask_list, dtype=np.uint8
+        )
 
     for mapping in mappings:
         start = max(0, int(mapping.start))
@@ -385,12 +452,10 @@ def build_mapping_overlay_data(
         try:
             chunk = qmp_read_bytes(qmp, start, span, chunk_size=MAPPING_FETCH_CHUNK)
         except Exception:
+            logger.debug("Unable to fetch overlay bytes for %s", mapping, exc_info=True)
             continue
 
-        if hasattr(chunk, "tolist"):
-            chunk_vals = chunk.tolist()
-        else:
-            chunk_vals = list(chunk)
+        chunk_vals = chunk.tolist() if hasattr(chunk, "tolist") else list(chunk)
         if len(chunk_vals) < span:
             chunk_vals.extend([0] * (span - len(chunk_vals)))
         elif len(chunk_vals) > span:
@@ -406,11 +471,10 @@ def build_mapping_overlay_data(
 
 def apply_overlay_block(
     base_block: np.ndarray,
-    overlay_block: Optional[np.ndarray],
-    overlay_mask_block: Optional[np.ndarray],
+    overlay_block: np.ndarray | None,
+    overlay_mask_block: np.ndarray | None,
 ) -> np.ndarray:
     """Return ``base_block`` with overlay bytes applied where available."""
-
     base_arr = np.asarray(base_block)
     if overlay_block is None or overlay_mask_block is None:
         return base_arr
@@ -434,10 +498,7 @@ def apply_overlay_block(
             length = len(obj)  # type: ignore[arg-type]
         except Exception:
             return bool(obj)
-        for idx in range(length):
-            if mask_any(obj[idx]):  # type: ignore[index]
-                return True
-        return False
+        return any(mask_any(obj[idx]) for idx in range(length))  # type: ignore[index]
 
     if not mask_any(mask_arr):
         return base_arr
@@ -457,15 +518,20 @@ def apply_overlay_block(
     return np.asarray(combined, dtype=np.uint8)
 
 
-def render_vga_text(chars_attrs: np.ndarray, font: "ImageFont.FreeTypeFont") -> np.ndarray:
+def render_vga_text(
+    chars_attrs: np.ndarray, font: ImageFont.FreeTypeFont
+) -> np.ndarray:
+    """Render the VGA text buffer into an RGB image array."""
     try:
         from PIL import Image, ImageDraw
-    except ModuleNotFoundError as exc:  # pragma: no cover - exercised when Pillow missing
+    except (
+        ModuleNotFoundError
+    ) as exc:  # pragma: no cover - exercised when Pillow missing
         raise RuntimeError("Rendering VGA panels requires Pillow") from exc
 
     try:
-        l, t, r, b = font.getbbox("M")
-        cw = max(8, r - l)
+        left, _top, right, _bottom = font.getbbox("M")
+        cw = max(8, right - left)
         ascent, descent = font.getmetrics()
         ch = max(12, ascent + descent)
     except Exception:
@@ -485,7 +551,9 @@ def render_vga_text(chars_attrs: np.ndarray, font: "ImageFont.FreeTypeFont") -> 
 
 # -------- Main viewer --------
 
+
 def main() -> None:
+    """Launch the interactive memory viewer UI."""
     try:
         import matplotlib.pyplot as plt
         from matplotlib import colors as mcolors
@@ -494,13 +562,19 @@ def main() -> None:
     except ModuleNotFoundError as exc:  # pragma: no cover - viewer path only
         raise RuntimeError("Matplotlib is required to run the viewer") from exc
 
-    p = argparse.ArgumentParser(description="Live memory viewer with CP437 magnifier and VGA B800h panel")
+    p = argparse.ArgumentParser(
+        description="Live memory viewer with CP437 magnifier and VGA B800h panel"
+    )
     p.add_argument("path", help="RAM file path, e.g., /tmp/guest486.ram")
     p.add_argument("--width", type=int, default=1024, help="bytes per row in RAM view")
     p.add_argument("--height", type=int, default=1024, help="rows in RAM view")
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--min-window", type=int, default=16)
-    p.add_argument("--qmp-sock", required=True, help="QMP UNIX socket path (e.g., /tmp/qmp-486.sock)")
+    p.add_argument(
+        "--qmp-sock",
+        required=True,
+        help="QMP UNIX socket path (e.g., /tmp/qmp-486.sock)",
+    )
     args = p.parse_args()
 
     size = os.path.getsize(args.path)
@@ -511,19 +585,19 @@ def main() -> None:
     mm = np.memmap(args.path, dtype=np.uint8, mode="r")
     full = mm[:pixels].reshape(args.height, args.width)
 
-    mapping_mask_full: Optional[np.ndarray] = None
+    mapping_mask_full: np.ndarray | None = None
     mapping_overlay_im = None
-    mapping_visible: List[MemoryMapping] = []
-    mapping_data_full: Optional[np.ndarray] = None
-    mapping_data_mask_full: Optional[np.ndarray] = None
+    mapping_visible: list[MemoryMapping] = []
+    mapping_data_full: np.ndarray | None = None
+    mapping_data_mask_full: np.ndarray | None = None
 
     vx0, vy0 = 0, 0
     vW, vH = args.width, args.height
     need_axes_refresh = True
-    guide_lines: list = []
+    guide_lines: list[object] = []
 
-    sel_cx: Optional[int] = args.width // 2
-    sel_cy: Optional[int] = args.height // 2
+    sel_cx: int | None = args.width // 2
+    sel_cy: int | None = args.height // 2
 
     active_regions = [region for region in DISPLAY_REGIONS if region.start < pixels]
 
@@ -545,28 +619,29 @@ def main() -> None:
         for region in active_regions
     ]
     region_color_lookup = {
-        (region.start, region.end, region.label): region.color for region in active_regions
+        (region.start, region.end, region.label): region.color
+        for region in active_regions
     }
 
-    def find_region_for_address(addr: int) -> Optional[DisplayRegion]:
+    def find_region_for_address(addr: int) -> DisplayRegion | None:
         for region in active_regions:
             if region.start <= addr <= region.end:
                 return region
         return None
 
     def view_slice() -> np.ndarray:
-        return full[vy0:vy0 + vH, vx0:vx0 + vW]
+        return full[vy0 : vy0 + vH, vx0 : vx0 + vW]
 
     def view_slice_with_overlay() -> np.ndarray:
         base_view = view_slice()
         if mapping_data_full is None or mapping_data_mask_full is None:
             return base_view
 
-        overlay_view = mapping_data_full[vy0:vy0 + vH, vx0:vx0 + vW]
-        mask_view = mapping_data_mask_full[vy0:vy0 + vH, vx0:vx0 + vW]
+        overlay_view = mapping_data_full[vy0 : vy0 + vH, vx0 : vx0 + vW]
+        mask_view = mapping_data_mask_full[vy0 : vy0 + vH, vx0 : vx0 + vW]
         return apply_overlay_block(base_view, overlay_view, mask_view)
 
-    def flatten_array(arr: Optional[np.ndarray]) -> List[int]:
+    def flatten_array(arr: np.ndarray | None) -> list[int]:
         if arr is None:
             return []
 
@@ -577,7 +652,7 @@ def main() -> None:
             except TypeError:
                 source = arr
 
-        flat: List[int] = []
+        flat: list[int] = []
         stack = [source]
         while stack:
             item = stack.pop()
@@ -592,7 +667,7 @@ def main() -> None:
         flat.reverse()
         return flat
 
-    def mask_has_values(arr: Optional[np.ndarray]) -> bool:
+    def mask_has_values(arr: np.ndarray | None) -> bool:
         return any(bool(v) for v in flatten_array(arr))
 
     def magnifier_block_at(sx: int, sy: int) -> np.ndarray:
@@ -616,8 +691,8 @@ def main() -> None:
         guide_lines.clear()
         ax.set_xlim(-0.5, vW - 0.5)
         ax.set_ylim(vH - 0.5, -0.5)
-        y_ticks: List[float] = []
-        y_labels: List[str] = []
+        y_ticks: list[float] = []
+        y_labels: list[str] = []
         for y_pos, label in marker_specs:
             if vy0 <= y_pos < (vy0 + vH):
                 y = y_pos - vy0
@@ -627,16 +702,18 @@ def main() -> None:
         ax.set_yticks(y_ticks)
         ax.set_yticklabels(y_labels)
         ax.tick_params(axis="y", which="both", labelsize=8, pad=4)
-        ax.tick_params(axis="x", which="both", bottom=False, top=False, labelbottom=False)
+        ax.tick_params(
+            axis="x", which="both", bottom=False, top=False, labelbottom=False
+        )
         need_axes_refresh = False
 
-    def set_view(center: Tuple[int, int], scale: float) -> None:
+    def set_view(center: tuple[int, int], scale: float) -> None:
         nonlocal vx0, vy0, vW, vH, need_axes_refresh
         cx, cy = center
-        newW = clamp(int(round(vW * scale)), args.min_window, args.width)
-        newH = clamp(int(round(vH * scale)), args.min_window, args.height)
-        vx = int(round(cx - newW / 2))
-        vy = int(round(cy - newH / 2))
+        newW = clamp(round(vW * scale), args.min_window, args.width)
+        newH = clamp(round(vH * scale), args.min_window, args.height)
+        vx = round(cx - newW / 2)
+        vy = round(cy - newH / 2)
         vx0 = clamp(vx, 0, args.width - newW)
         vy0 = clamp(vy, 0, args.height - newH)
         vW, vH = newW, newH
@@ -655,9 +732,9 @@ def main() -> None:
     ax_mag = fig.add_subplot(gs[0, 2])
     ax_vga = fig.add_subplot(gs[0, 3])
     ax_legend.set_axis_off()
-    ax_mag.set_title(f"{PANEL_SIZE}×{PANEL_SIZE} CP437 bytes")
+    ax_mag.set_title(f"{PANEL_SIZE}x{PANEL_SIZE} CP437 bytes")
     ax_mag.set_axis_off()
-    ax_vga.set_title("VGA text @ B800:0000 (80×25)")
+    ax_vga.set_title("VGA text @ B800:0000 (80x25)")
     ax_vga.set_axis_off()
 
     im = ax.imshow(
@@ -670,13 +747,16 @@ def main() -> None:
     )
     ax.set_title(f"{args.path} ({args.width}x{args.height})")
     ax.margins(0)
-    rect = patches.Rectangle((0, 0), PANEL_SIZE, PANEL_SIZE, linewidth=1.2, edgecolor="red", facecolor="none")
+    rect = patches.Rectangle(
+        (0, 0), PANEL_SIZE, PANEL_SIZE, linewidth=1.2, edgecolor="red", facecolor="none"
+    )
     ax.add_patch(rect)
 
-    pointer_artists: List[Tuple[RegisterPointerSpec, object, object]] = []
+    pointer_artists: list[tuple[RegisterPointerSpec, object, object]] = []
     for spec in POINTER_SPECS:
-        marker_line, = ax.plot(
-            [], [],
+        (marker_line,) = ax.plot(
+            [],
+            [],
             marker="o",
             markersize=8,
             markerfacecolor="none",
@@ -693,7 +773,7 @@ def main() -> None:
             fontweight="bold",
             ha="left",
             va="bottom",
-            bbox=dict(facecolor=(0.0, 0.0, 0.0, 0.6), edgecolor="none", pad=1.5),
+            bbox={"facecolor": (0.0, 0.0, 0.0, 0.6), "edgecolor": "none", "pad": 1.5},
         )
         marker_line.set_visible(False)
         label_text.set_visible(False)
@@ -708,7 +788,7 @@ def main() -> None:
         fontsize=9,
         ha="left",
         va="top",
-        bbox=dict(facecolor=(0.0, 0.0, 0.0, 0.65), edgecolor="none", pad=1.8),
+        bbox={"facecolor": (0.0, 0.0, 0.0, 0.65), "edgecolor": "none", "pad": 1.8},
     )
 
     font_small = pick_mono_font(13)
@@ -719,7 +799,11 @@ def main() -> None:
     block0 = magnifier_block_at(sx0, sy0)
     im_mag = ax_mag.imshow(
         render_text_panel(block0, font_small),
-        cmap="gray", vmin=0, vmax=255, interpolation="nearest", origin="upper"
+        cmap="gray",
+        vmin=0,
+        vmax=255,
+        interpolation="nearest",
+        origin="upper",
     )
 
     qmp = QMP(args.qmp_sock)
@@ -728,7 +812,9 @@ def main() -> None:
         vga0 = qmp_read_b800(qmp)
     except Exception:
         vga0 = np.zeros((VGA_ROWS, VGA_COLS, 2), dtype=np.uint8)
-    im_vga = ax_vga.imshow(render_vga_text(vga0, font_vga), interpolation="nearest", origin="upper")
+    im_vga = ax_vga.imshow(
+        render_vga_text(vga0, font_vga), interpolation="nearest", origin="upper"
+    )
 
     if overlay_mappings:
         mask_flat, mapping_visible = build_mapping_mask(overlay_mappings, pixels)
@@ -736,37 +822,50 @@ def main() -> None:
             mapping_mask_full = mask_flat.reshape(args.height, args.width)
 
             try:
-                data_flat, data_mask_flat = build_mapping_overlay_data(qmp, mapping_visible, pixels)
+                data_flat, data_mask_flat = build_mapping_overlay_data(
+                    qmp, mapping_visible, pixels
+                )
             except Exception:
                 data_flat = data_mask_flat = None
-            if data_flat is not None and data_mask_flat is not None and mask_has_values(data_mask_flat):
+            if (
+                data_flat is not None
+                and data_mask_flat is not None
+                and mask_has_values(data_mask_flat)
+            ):
                 mapping_data_full = data_flat.reshape(args.height, args.width)
                 mapping_data_mask_full = data_mask_flat.reshape(args.height, args.width)
                 im.set_data(view_slice_with_overlay())
-                im_mag.set_data(render_text_panel(magnifier_block_at(sx0, sy0), font_small))
+                im_mag.set_data(
+                    render_text_panel(magnifier_block_at(sx0, sy0), font_small)
+                )
 
             color_entries = [(0.0, 0.0, 0.0, 0.0)]
             for mapping in mapping_visible:
-                color = region_color_lookup.get((mapping.start, mapping.end, mapping.label), "#cccccc")
+                color = region_color_lookup.get(
+                    (mapping.start, mapping.end, mapping.label), "#cccccc"
+                )
                 rgba = mcolors.to_rgba(color, alpha=0.25)
                 color_entries.append(rgba)
             overlay_cmap = mcolors.ListedColormap(color_entries, name="memory_layout")
-            overlay_norm = mcolors.BoundaryNorm(np.arange(len(color_entries) + 1) - 0.5, len(color_entries))
+            overlay_norm = mcolors.BoundaryNorm(
+                np.arange(len(color_entries) + 1) - 0.5, len(color_entries)
+            )
             mapping_overlay_im = ax.imshow(
-                mapping_mask_full[vy0:vy0 + vH, vx0:vx0 + vW],
+                mapping_mask_full[vy0 : vy0 + vH, vx0 : vx0 + vW],
                 cmap=overlay_cmap,
                 norm=overlay_norm,
                 interpolation="nearest",
                 origin="upper",
                 zorder=im.get_zorder() + 0.1,
             )
-            legend_handles: List[patches.Patch] = []
+            legend_handles: list[patches.Patch] = []
             for idx, mapping in enumerate(mapping_visible, start=1):
                 rgba = overlay_cmap(idx)
+                range_text = f"0x{mapping.start:08X}-0x{mapping.end:08X}"
                 handle = patches.Patch(
                     facecolor=rgba,
                     edgecolor=(rgba[0], rgba[1], rgba[2], min(1.0, rgba[3] + 0.2)),
-                    label=f"{mapping.label} (0x{mapping.start:08X}-0x{mapping.end:08X})",
+                    label=f"{mapping.label} ({range_text})",
                 )
                 legend_handles.append(handle)
             if legend_handles:
@@ -782,9 +881,9 @@ def main() -> None:
 
     refresh_axes()
 
-    register_state: Dict[str, int] = {}
+    register_state: dict[str, int] = {}
 
-    def update_pointer_plot(registers: Dict[str, int]) -> None:
+    def update_pointer_plot(registers: dict[str, int]) -> None:
         for spec, marker_line, label_text in pointer_artists:
             addr = compute_pointer_address(registers, spec) if registers else None
             if addr is None or not (0 <= addr < pixels):
@@ -804,18 +903,18 @@ def main() -> None:
             marker_line.set_data([lx], [ly])
             marker_line.set_visible(True)
 
-            label_x = float(clamp(int(round(lx + 2)), 0, max(0, vW - 1)))
-            label_y = float(clamp(int(round(ly + 2)), 0, max(0, vH - 1)))
+            label_x = float(clamp(round(lx + 2), 0, max(0, vW - 1)))
+            label_y = float(clamp(round(ly + 2), 0, max(0, vH - 1)))
             label_text.set_position((label_x, label_y))
             label_text.set_visible(True)
 
     try:
         register_state = parse_register_dump(qmp.hmp("info registers"))
     except Exception:
-        pass
+        logger.debug("Unable to fetch initial register state", exc_info=True)
     update_pointer_plot(register_state)
 
-    def on_key(event):
+    def on_key(event: KeyEvent) -> None:
         nonlocal vx0, vy0, vW, vH, need_axes_refresh, sel_cx, sel_cy
         if event.key in ("+", "=", "kp_add"):
             cx, cy = vx0 + vW // 2, vy0 + vH // 2
@@ -837,18 +936,18 @@ def main() -> None:
         elif event.key == "m":
             sel_cx, sel_cy = vx0 + vW // 2, vy0 + vH // 2
 
-    def on_move(event):
+    def on_move(event: MouseEvent) -> None:
         nonlocal sel_cx, sel_cy
         if event.inaxes != ax or event.xdata is None or event.ydata is None:
             return
-        sel_cx = vx0 + int(round(event.xdata))
-        sel_cy = vy0 + int(round(event.ydata))
+        sel_cx = vx0 + round(event.xdata)
+        sel_cy = vy0 + round(event.ydata)
 
-    def on_scroll(event):
+    def on_scroll(event: MouseEvent) -> None:
         if event.inaxes != ax or event.xdata is None or event.ydata is None:
             return
-        cx = vx0 + int(round(event.xdata))
-        cy = vy0 + int(round(event.ydata))
+        cx = vx0 + round(event.xdata)
+        cy = vy0 + round(event.ydata)
         if event.button == "up":
             set_view((cx, cy), 0.8)
         elif event.button == "down":
@@ -858,17 +957,21 @@ def main() -> None:
     cid_s = fig.canvas.mpl_connect("scroll_event", on_scroll)
     cid_m = fig.canvas.mpl_connect("motion_notify_event", on_move)
 
-    def update(_):
+    def update(_: object) -> tuple[object, ...]:
         nonlocal need_axes_refresh, register_state
         im.set_data(view_slice_with_overlay())
         if mapping_overlay_im is not None and mapping_mask_full is not None:
-            mapping_overlay_im.set_data(mapping_mask_full[vy0:vy0 + vH, vx0:vx0 + vW])
+            mapping_overlay_im.set_data(
+                mapping_mask_full[vy0 : vy0 + vH, vx0 : vx0 + vW]
+            )
             mapping_overlay_im.set_extent((-0.5, vW - 0.5, vH - 0.5, -0.5))
         if need_axes_refresh:
             refresh_axes()
 
         cx = clamp(sel_cx if sel_cx is not None else args.width // 2, 0, args.width - 1)
-        cy = clamp(sel_cy if sel_cy is not None else args.height // 2, 0, args.height - 1)
+        cy = clamp(
+            sel_cy if sel_cy is not None else args.height // 2, 0, args.height - 1
+        )
         sx = clamp(cx - PANEL_SIZE // 2, 0, args.width - PANEL_SIZE)
         sy = clamp(cy - PANEL_SIZE // 2, 0, args.height - PANEL_SIZE)
 
@@ -881,21 +984,27 @@ def main() -> None:
         addr = cy * args.width + cx
         region = find_region_for_address(addr)
         if region is None:
-            hover_lines = ["Unlabeled memory", f"0x{addr:08X} ({format_kib_from_bytes(addr)})"]
+            hover_lines = [
+                "Unlabeled memory",
+                f"0x{addr:08X} ({format_kib_from_bytes(addr)})",
+            ]
         else:
-            hover_lines = [region.label, f"0x{addr:08X} ({format_kib_from_bytes(addr)})"]
+            hover_lines = [
+                region.label,
+                f"0x{addr:08X} ({format_kib_from_bytes(addr)})",
+            ]
         hover_text.set_text("\n".join(hover_lines))
 
         try:
             vga = qmp_read_b800(qmp)
             im_vga.set_data(render_vga_text(vga, font_vga))
         except Exception:
-            pass
+            logger.debug("Unable to refresh VGA text", exc_info=True)
 
         try:
             reg_txt = qmp.hmp("info registers")
         except Exception:
-            pass
+            logger.debug("Unable to refresh register state", exc_info=True)
         else:
             register_state = parse_register_dump(reg_txt)
 
@@ -910,7 +1019,9 @@ def main() -> None:
         return tuple(artists)
 
     interval_ms = int(1000 / max(1, args.fps))
-    anim = FuncAnimation(fig, update, interval=interval_ms, blit=False, cache_frame_data=False)
+    anim = FuncAnimation(
+        fig, update, interval=interval_ms, blit=False, cache_frame_data=False
+    )
     plt.show()
     _ = (cid_k, cid_s, cid_m, anim)
 

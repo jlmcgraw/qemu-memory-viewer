@@ -36,10 +36,18 @@ class DummyChunkQMP:
 
 def test_extract_hex_bytes_handles_varied_formats() -> None:
     sample = (
-        "0x0000000000000000: 0x41 0x07 43 1f\n"
-        "0x0000000000000010: 50 aa bb cc dd ee\n"
+        "0x0000000000000000: 0x41 0x07 43 1f\n0x0000000000000010: 50 aa bb cc dd ee\n"
     )
-    assert main._extract_hex_bytes(sample, 8) == [0x41, 0x07, 0x43, 0x1F, 0x50, 0xAA, 0xBB, 0xCC]
+    assert main._extract_hex_bytes(sample, 8) == [
+        0x41,
+        0x07,
+        0x43,
+        0x1F,
+        0x50,
+        0xAA,
+        0xBB,
+        0xCC,
+    ]
 
 
 def test_parse_register_dump_extracts_segment_base() -> None:

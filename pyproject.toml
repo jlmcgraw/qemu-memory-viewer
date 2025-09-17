@@ -130,7 +130,7 @@ reportUnusedCallResult = false
 
 
 [tool.typos.default]
-extend-ignore-identifiers-re = []
+extend-ignore-identifiers-re = ["NDArray"]
 
 
 [tool.hatch.build.targets.wheel]
