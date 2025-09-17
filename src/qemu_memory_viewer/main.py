@@ -11,10 +11,19 @@ import json
 import os
 import re
 import socket
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
-from . import _compat_numpy as np
+if __package__ in (None, ""):
+    import importlib
+
+    PACKAGE_ROOT = os.path.dirname(os.path.dirname(__file__))
+    if PACKAGE_ROOT not in sys.path:
+        sys.path.insert(0, PACKAGE_ROOT)
+    np = importlib.import_module("qemu_memory_viewer._compat_numpy")
+else:  # pragma: no cover - exercised via unit tests
+    from . import _compat_numpy as np
 
 if TYPE_CHECKING:  # pragma: no cover - typing helpers only
     from PIL import ImageFont
