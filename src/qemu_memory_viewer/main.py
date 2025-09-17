@@ -111,7 +111,7 @@ def render_text_panel(block: np.ndarray, font: ImageFont.FreeTypeFont) -> np.nda
 
     lines = bytes_to_cp437_lines(block)
     try:
-        left, top, right, bottom = font.getbbox("M")
+        left, _top, right, _bottom = font.getbbox("M")
         cell_w = max(8, right - left)
         ascent, descent = font.getmetrics()
         cell_h = max(12, ascent + descent)
@@ -532,7 +532,7 @@ def render_vga_text(
         raise RuntimeError("Rendering VGA panels requires Pillow") from exc
 
     try:
-        left, top, right, bottom = font.getbbox("M")
+        left, _top, right, _bottom = font.getbbox("M")
         cw = max(8, right - left)
         ascent, descent = font.getmetrics()
         ch = max(12, ascent + descent)
