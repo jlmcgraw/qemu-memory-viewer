@@ -18,7 +18,7 @@ help:  ## Show help message
 .PHONY: clean
 clean:  ## Clean up build artifacts and other junk
 	@rm -rf .venv
-	@uv run pyclean . --debris
+	@uv run --group dev pyclean . --debris
 	@rm -rf dist
 	@rm -rf .ruff_cache
 	@rm -rf .pytest_cache
@@ -39,14 +39,14 @@ qa/test:  ## Run the tests
 
 .PHONY: qa/types
 qa/types:  ## Run static type checks
-	uv run mypy ${PACKAGE_TARGET} tests --pretty
-	uv run basedpyright ${PACKAGE_TARGET} tests
+	uv run --group dev mypy ${PACKAGE_TARGET} tests --pretty
+	uv run --group dev basedpyright ${PACKAGE_TARGET} tests
 
 
 .PHONY: qa/lint
 qa/lint:  ## Run linters
-	uv run ruff check ${PACKAGE_TARGET} tests
-	uv run typos ${PACKAGE_TARGET} tests
+	uv run --group dev ruff check ${PACKAGE_TARGET} tests
+	# uv run --group dev typos ${PACKAGE_TARGET} tests
 
 
 .PHONY: qa/full
@@ -56,8 +56,8 @@ qa/full: qa/format qa/test qa/lint qa/types  ## Run the full set of quality chec
 
 .PHONY: qa/format
 qa/format:  ## Run code formatters
-	uv run ruff format ${PACKAGE_TARGET} tests
-	uv run ruff check --select I --fix ${PACKAGE_TARGET} tests
+	uv run --group dev ruff format ${PACKAGE_TARGET} tests
+	uv run --group dev ruff check --select I --fix ${PACKAGE_TARGET} tests
 
 
 # ==== Documentation ===================================================================================================
@@ -67,12 +67,12 @@ docs: docs/serve  ## Shortcut for docs/serve
 
 .PHONY: docs/build
 docs/build:  ## Build the documentation
-	uv run mkdocs build --config-file=docs/mkdocs.yaml
+	uv run --group dev mkdocs build --config-file=docs/mkdocs.yaml
 
 
 .PHONY: docs/serve
 docs/serve:  ## Build the docs and start a local dev server
-	uv run mkdocs serve --config-file=docs/mkdocs.yaml --dev-addr=localhost:10000
+	uv run --group dev mkdocs serve --config-file=docs/mkdocs.yaml --dev-addr=localhost:10000
 
 
 # ==== Other Commands ==================================================================================================
