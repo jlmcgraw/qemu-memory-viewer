@@ -250,29 +250,39 @@ except ModuleNotFoundError:  # pragma: no cover - exercised in the test environm
     ]
 
 else:  # pragma: no cover - exercised when numpy is installed
-    ndarray = _np.ndarray
     uint8 = _np.uint8
 
     class _CompatNDArray(_np.ndarray):
         """Subclass that flattens :meth:`tolist` results for compatibility."""
 
+        def __new__(cls, input_array: object, dtype: object | None = None):
+            base = _np.asarray(input_array, dtype=dtype)
+            if isinstance(base, cls):
+                return base
+            return base.view(cls)
+
         def __array_finalize__(self, obj) -> None:  # pragma: no cover - numpy protocol hook
             return None
 
         def tolist(self) -> list[int]:  # pragma: no cover - behaviour verified via tests
-            flat = super().reshape(-1).tolist()
+            flat = _np.asarray(self).reshape(-1).tolist()
             return [int(value) for value in flat]
 
 
-    def _wrap(arr: _np.ndarray) -> _CompatNDArray:
-        if isinstance(arr, _CompatNDArray):
-            return arr
-        return arr.view(_CompatNDArray)
+    ndarray = _CompatNDArray
+
+
+    def _wrap(arr: _np.ndarray, *, dtype: object | None = None) -> _CompatNDArray:
+        if not isinstance(arr, _CompatNDArray):
+            arr = arr.view(_CompatNDArray)
+        if dtype is not None and arr.dtype != dtype:
+            return _CompatNDArray(arr, dtype=dtype)
+        return arr
 
 
     def asarray(obj: object, dtype: object = uint8) -> _CompatNDArray:
         arr = _np.asarray(obj, dtype=dtype)
-        return _wrap(arr)
+        return _wrap(arr, dtype=dtype)
 
 
     def array(obj: object, dtype: object = uint8) -> _CompatNDArray:
@@ -281,17 +291,17 @@ else:  # pragma: no cover - exercised when numpy is installed
 
     def zeros(shape: Union[int, Sequence[int]], dtype: object = uint8) -> _CompatNDArray:
         arr = _np.zeros(shape, dtype=dtype)
-        return _wrap(arr)
+        return _wrap(arr, dtype=dtype)
 
 
     def frombuffer(buffer: Iterable[int], dtype: object = uint8) -> _CompatNDArray:
         arr = _np.frombuffer(buffer, dtype=dtype)
-        return _wrap(arr)
+        return _wrap(arr, dtype=dtype)
 
 
     def memmap(path: Union[str, Path], dtype: object = uint8, mode: str = "r") -> _CompatNDArray:
         arr = _np.memmap(path, dtype=dtype, mode=mode)
-        return _wrap(arr)
+        return _wrap(arr, dtype=dtype)
 
 
     __all__ = [
