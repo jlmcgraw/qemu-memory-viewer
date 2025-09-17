@@ -119,6 +119,10 @@ warn_unreachable = true
 warn_unused_ignores = true
 
 [[tool.mypy.overrides]]
+module = ["numpy", "numpy.*", "PIL", "PIL.*", "matplotlib", "matplotlib.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = []
 ignore_missing_imports = true
 
