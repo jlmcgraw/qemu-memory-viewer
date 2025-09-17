@@ -265,7 +265,8 @@ else:  # pragma: no cover - exercised when numpy is installed
             return None
 
         def tolist(self) -> list[int]:  # pragma: no cover - behaviour verified via tests
-            flat = _np.asarray(self).reshape(-1).tolist()
+            base = self.view(_np.ndarray)
+            flat = base.reshape(-1).tolist()
             return [int(value) for value in flat]
 
 
