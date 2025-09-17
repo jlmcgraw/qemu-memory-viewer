@@ -14,10 +14,7 @@ import socket
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
-try:  # pragma: no cover - exercised when numpy is available
-    import numpy as np
-except ModuleNotFoundError:  # pragma: no cover - fallback exercised in tests
-    from . import _compat_numpy as np
+from . import _compat_numpy as np
 
 if TYPE_CHECKING:  # pragma: no cover - typing helpers only
     from PIL import ImageFont
