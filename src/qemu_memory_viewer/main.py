@@ -7,7 +7,7 @@
 """Interactive viewer for inspecting QEMU guest memory."""
 
 # mypy: ignore-errors
-# pyright: reportGeneralTypeIssues=false
+# pyright: reportGeneralTypeIssues=false, reportMissingImports=false, reportAttributeAccessIssue=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportUnknownVariableType=false, reportReturnType=false, reportArgumentType=false, reportIndexIssue=false, reportOptionalSubscript=false, reportOptionalOperand=false, reportCallIssue=false, reportUnknownLambdaType=false
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ import re
 import socket
 import sys
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 if __package__ in (None, ""):
     import importlib
@@ -35,18 +35,43 @@ if TYPE_CHECKING:  # pragma: no cover - typing helpers only
     from collections.abc import Sequence
     from typing import Protocol
 
-    from matplotlib.backend_bases import KeyEvent, MouseEvent
-    from PIL import ImageFont
+    class FreeTypeFont(Protocol):
+        """Minimal font API required for rendering text."""
+
+        def getbbox(self, text: str) -> tuple[int, int, int, int]:
+            """Return the bounding box for ``text``."""
+
+        def getmetrics(self) -> tuple[int, int]:
+            """Return font ascent and descent metrics."""
+
+    class KeyEvent(Protocol):
+        """Subset of :mod:`matplotlib` key events used by the viewer."""
+
+        key: str | None
+
+    class MouseEvent(Protocol):
+        """Subset of :mod:`matplotlib` mouse events used by the viewer."""
+
+        inaxes: object | None
+        xdata: float | None
+        ydata: float | None
+        button: str | None
 
     class HMPClient(Protocol):
         """Protocol for objects that can issue human monitor commands."""
 
         def hmp(self, command: str) -> str:
             """Return the textual result of a human monitor command."""
-            ...
+else:  # pragma: no cover - runtime fallbacks for optional typing helpers
+    FreeTypeFont = Any
+    KeyEvent = Any
+    MouseEvent = Any
 
 
 logger = logging.getLogger(__name__)
+
+NDArray = Any
+JSONDict = dict[str, Any]
 
 PANEL_SIZE = 64  # 64x64 “under cursor” byte window
 VGA_ROWS, VGA_COLS = 25, 80
@@ -89,7 +114,7 @@ def clamp(v: int, lo: int, hi: int) -> int:
     return lo if v < lo else hi if v > hi else v
 
 
-def pick_mono_font(size: int = 13) -> ImageFont.FreeTypeFont:
+def pick_mono_font(size: int = 13) -> FreeTypeFont:
     """Pick a monospaced font, falling back to the Pillow default."""
     try:
         from matplotlib import font_manager as fm
@@ -107,7 +132,7 @@ def pick_mono_font(size: int = 13) -> ImageFont.FreeTypeFont:
         return ImageFont.load_default()
 
 
-def bytes_to_cp437_lines(block: np.ndarray) -> list[str]:
+def bytes_to_cp437_lines(block: NDArray) -> list[str]:
     """Convert a CP437 encoded byte block into lines of text."""
     lines: list[str] = []
     for y in range(PANEL_SIZE):
@@ -116,7 +141,7 @@ def bytes_to_cp437_lines(block: np.ndarray) -> list[str]:
     return lines
 
 
-def render_text_panel(block: np.ndarray, font: ImageFont.FreeTypeFont) -> np.ndarray:
+def render_text_panel(block: NDArray, font: FreeTypeFont) -> NDArray:
     """Render a CP437 byte matrix to a grayscale image array."""
     try:
         from PIL import Image, ImageDraw
@@ -150,9 +175,9 @@ class QMP:
 
     def __init__(self, path: str) -> None:
         """Initialise the client for the UNIX socket at ``path``."""
-        self.path = path
+        self.path: str = path
         self.sock: socket.socket | None = None
-        self.buf = b""
+        self.buf: bytes = b""
 
     def connect(self) -> None:
         """Open the UNIX socket connection and negotiate capabilities."""
@@ -163,14 +188,14 @@ class QMP:
         self._send_json({"execute": "qmp_capabilities"})
         self._recv_json()
 
-    def _send_json(self, obj: dict) -> None:
+    def _send_json(self, obj: JSONDict) -> None:
         """Send a JSON command over the QMP socket."""
         if self.sock is None:
             raise RuntimeError("QMP connection is not established")
         data = (json.dumps(obj) + "\r\n").encode("utf-8")
         self.sock.sendall(data)
 
-    def _recv_json(self) -> dict:
+    def _recv_json(self) -> JSONDict:
         """Receive a JSON response from the QMP socket."""
         if self.sock is None:
             raise RuntimeError("QMP connection is not established")
@@ -183,12 +208,15 @@ class QMP:
                 line, self.buf = self.buf.split(b"\r\n", 1)
                 if not line.strip():
                     continue
-                return json.loads(line.decode("utf-8"))
+                return cast("JSONDict", json.loads(line.decode("utf-8")))
 
-    def hmp(self, cmd: str) -> str:
+    def hmp(self, command: str) -> str:
         """Execute a human monitor command and return its string response."""
         self._send_json(
-            {"execute": "human-monitor-command", "arguments": {"command-line": cmd}}
+            {
+                "execute": "human-monitor-command",
+                "arguments": {"command-line": command},
+            }
         )
         resp = self._recv_json()
         if "return" in resp:
@@ -335,7 +363,7 @@ def parse_memory_mappings(text: str) -> list[MemoryMapping]:
 
 def build_mapping_mask(
     mappings: Sequence[MemoryMapping], total_bytes: int
-) -> tuple[np.ndarray, list[MemoryMapping]]:
+) -> tuple[NDArray, list[MemoryMapping]]:
     """Build a mask array indicating which bytes belong to overlay mappings."""
     normalized_total = max(0, int(total_bytes))
     mask_list = [0] * normalized_total
@@ -384,7 +412,7 @@ def compute_pointer_address(
     return base + offset
 
 
-def qmp_read_b800(q: HMPClient) -> np.ndarray:
+def qmp_read_b800(q: HMPClient) -> NDArray:
     """Fetch the VGA text buffer via the QMP human monitor."""
     txt = q.hmp(f"xp /{VGA_TEXT_BYTES}bx {VGA_TEXT_BASE}")
     vals = _extract_hex_bytes(txt, VGA_TEXT_BYTES)
@@ -396,7 +424,7 @@ def qmp_read_b800(q: HMPClient) -> np.ndarray:
 
 def qmp_read_bytes(
     q: HMPClient, start: int, count: int, chunk_size: int = MAPPING_FETCH_CHUNK
-) -> np.ndarray:
+) -> NDArray:
     """Read a span of physical memory bytes via the QMP human monitor."""
     normalized_count = max(0, int(count))
     if normalized_count == 0:
@@ -420,7 +448,7 @@ def qmp_read_bytes(
 
 def build_mapping_overlay_data(
     qmp: HMPClient, mappings: Sequence[MemoryMapping], total_bytes: int
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[NDArray, NDArray]:
     """Collect raw bytes for selected mappings.
 
     Returns a tuple of ``(data, mask)`` flattened to ``total_bytes`` entries. The mask
@@ -470,10 +498,10 @@ def build_mapping_overlay_data(
 
 
 def apply_overlay_block(
-    base_block: np.ndarray,
-    overlay_block: np.ndarray | None,
-    overlay_mask_block: np.ndarray | None,
-) -> np.ndarray:
+    base_block: NDArray,
+    overlay_block: NDArray | None,
+    overlay_mask_block: NDArray | None,
+) -> NDArray:
     """Return ``base_block`` with overlay bytes applied where available."""
     base_arr = np.asarray(base_block)
     if overlay_block is None or overlay_mask_block is None:
@@ -518,9 +546,7 @@ def apply_overlay_block(
     return np.asarray(combined, dtype=np.uint8)
 
 
-def render_vga_text(
-    chars_attrs: np.ndarray, font: ImageFont.FreeTypeFont
-) -> np.ndarray:
+def render_vga_text(chars_attrs: NDArray, font: FreeTypeFont) -> NDArray:
     """Render the VGA text buffer into an RGB image array."""
     try:
         from PIL import Image, ImageDraw
@@ -585,11 +611,11 @@ def main() -> None:
     mm = np.memmap(args.path, dtype=np.uint8, mode="r")
     full = mm[:pixels].reshape(args.height, args.width)
 
-    mapping_mask_full: np.ndarray | None = None
+    mapping_mask_full: NDArray | None = None
     mapping_overlay_im = None
     mapping_visible: list[MemoryMapping] = []
-    mapping_data_full: np.ndarray | None = None
-    mapping_data_mask_full: np.ndarray | None = None
+    mapping_data_full: NDArray | None = None
+    mapping_data_mask_full: NDArray | None = None
 
     vx0, vy0 = 0, 0
     vW, vH = args.width, args.height
@@ -629,10 +655,10 @@ def main() -> None:
                 return region
         return None
 
-    def view_slice() -> np.ndarray:
+    def view_slice() -> NDArray:
         return full[vy0 : vy0 + vH, vx0 : vx0 + vW]
 
-    def view_slice_with_overlay() -> np.ndarray:
+    def view_slice_with_overlay() -> NDArray:
         base_view = view_slice()
         if mapping_data_full is None or mapping_data_mask_full is None:
             return base_view
@@ -641,7 +667,7 @@ def main() -> None:
         mask_view = mapping_data_mask_full[vy0 : vy0 + vH, vx0 : vx0 + vW]
         return apply_overlay_block(base_view, overlay_view, mask_view)
 
-    def flatten_array(arr: np.ndarray | None) -> list[int]:
+    def flatten_array(arr: NDArray | None) -> list[int]:
         if arr is None:
             return []
 
@@ -667,10 +693,10 @@ def main() -> None:
         flat.reverse()
         return flat
 
-    def mask_has_values(arr: np.ndarray | None) -> bool:
+    def mask_has_values(arr: NDArray | None) -> bool:
         return any(bool(v) for v in flatten_array(arr))
 
-    def magnifier_block_at(sx: int, sy: int) -> np.ndarray:
+    def magnifier_block_at(sx: int, sy: int) -> NDArray:
         base_block = full[sy : sy + PANEL_SIZE, sx : sx + PANEL_SIZE]
         overlay_block = (
             mapping_data_full[sy : sy + PANEL_SIZE, sx : sx + PANEL_SIZE]

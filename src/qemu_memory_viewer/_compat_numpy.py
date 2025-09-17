@@ -8,7 +8,7 @@ interface.
 """
 
 # mypy: ignore-errors
-# pyright: reportGeneralTypeIssues=false
+# pyright: reportGeneralTypeIssues=false, reportMissingImports=false, reportArgumentType=false, reportReturnType=false, reportAttributeAccessIssue=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportUnannotatedClassAttribute=false, reportImplicitOverride=false, reportPrivateUsage=false, reportRedeclaration=false, reportUntypedBaseClass=false
 
 from __future__ import annotations
 

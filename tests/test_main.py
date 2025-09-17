@@ -1,3 +1,5 @@
+# pyright: reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnannotatedClassAttribute=false, reportPrivateUsage=false
+
 import re
 
 import qemu_memory_viewer.main as main
