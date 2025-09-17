@@ -11,12 +11,18 @@ import json
 import os
 import re
 import socket
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
-try:  # pragma: no cover - exercised when numpy is available
-    import numpy as np
-except ModuleNotFoundError:  # pragma: no cover - fallback exercised in tests
+if __package__ in (None, ""):
+    import importlib
+
+    PACKAGE_ROOT = os.path.dirname(os.path.dirname(__file__))
+    if PACKAGE_ROOT not in sys.path:
+        sys.path.insert(0, PACKAGE_ROOT)
+    np = importlib.import_module("qemu_memory_viewer._compat_numpy")
+else:  # pragma: no cover - exercised via unit tests
     from . import _compat_numpy as np
 
 if TYPE_CHECKING:  # pragma: no cover - typing helpers only
@@ -47,16 +53,6 @@ for b in range(256):
 
 def clamp(v: int, lo: int, hi: int) -> int:
     return lo if v < lo else hi if v > hi else v
-
-
-def compute_marker_rows(markers_kib: List[int], full_width: int, full_height: int) -> List[int]:
-    rows = []
-    bpr = float(full_width)
-    for kib in markers_kib:
-        r = int((kib * 1024) // bpr)
-        if 0 <= r < full_height:
-            rows.append(r)
-    return rows
 
 
 def pick_mono_font(size: int = 13) -> "ImageFont.FreeTypeFont":
@@ -177,6 +173,30 @@ class MemoryMapping:
     @property
     def size(self) -> int:
         return self.end - self.start + 1
+
+
+@dataclass(frozen=True)
+class DisplayRegion:
+    """Predefined PC memory area to highlight in the viewer."""
+
+    start: int
+    end: int
+    label: str
+    color: str
+
+
+DISPLAY_REGIONS: Tuple[DisplayRegion, ...] = (
+    DisplayRegion(0x00000000, 0x000003FF, "Interrupt Vector Table", "#f4cccc"),
+    DisplayRegion(0x00000400, 0x000004FF, "BDA (BIOS Data Area)", "#fce5cd"),
+    DisplayRegion(0x00000500, 0x00007BFF, "Conventional memory (usable)", "#fff2cc"),
+    DisplayRegion(0x00007C00, 0x00007DFF, "OS BootSector", "#d9ead3"),
+    DisplayRegion(0x00007E00, 0x0007FFFF, "Conventional memory", "#cfe2f3"),
+    DisplayRegion(0x00080000, 0x0009FFFF, "EBDA (Extended BIOS Data Area)", "#d9d2e9"),
+    DisplayRegion(0x000A0000, 0x000BFFFF, "Video display memory", "#ead1dc"),
+    DisplayRegion(0x000C0000, 0x000C7FFF, "Video BIOS", "#ffe599"),
+    DisplayRegion(0x000C8000, 0x000EFFFF, "BIOS expansions", "#c9daf8"),
+    DisplayRegion(0x000F0000, 0x000FFFFF, "Motherboard BIOS", "#d0e0e3"),
+)
 
 
 POINTER_SPECS: Tuple[RegisterPointerSpec, ...] = (
@@ -493,7 +513,6 @@ def main() -> None:
 
     mapping_mask_full: Optional[np.ndarray] = None
     mapping_overlay_im = None
-    mapping_legend = None
     mapping_visible: List[MemoryMapping] = []
     mapping_data_full: Optional[np.ndarray] = None
     mapping_data_mask_full: Optional[np.ndarray] = None
@@ -506,8 +525,34 @@ def main() -> None:
     sel_cx: Optional[int] = args.width // 2
     sel_cy: Optional[int] = args.height // 2
 
-    markers_kib = [0, 128, 256, 512, 640, 768]
-    marker_rows_full = compute_marker_rows(markers_kib, args.width, args.height)
+    active_regions = [region for region in DISPLAY_REGIONS if region.start < pixels]
+
+    def format_kib_from_bytes(value: int) -> str:
+        kib = value / 1024.0
+        kib_str = f"{kib:.2f}".rstrip("0").rstrip(".")
+        return f"{kib_str} KiB"
+
+    marker_specs = []
+    for region in active_regions:
+        y_pos = region.start / float(args.width)
+        if 0 <= y_pos < args.height:
+            label = f"0x{region.start:08X} ({format_kib_from_bytes(region.start)})"
+            marker_specs.append((y_pos, label))
+    marker_specs.sort(key=lambda item: item[0])
+
+    overlay_mappings = [
+        MemoryMapping(start=region.start, end=region.end, label=region.label)
+        for region in active_regions
+    ]
+    region_color_lookup = {
+        (region.start, region.end, region.label): region.color for region in active_regions
+    }
+
+    def find_region_for_address(addr: int) -> Optional[DisplayRegion]:
+        for region in active_regions:
+            if region.start <= addr <= region.end:
+                return region
+        return None
 
     def view_slice() -> np.ndarray:
         return full[vy0:vy0 + vH, vx0:vx0 + vW]
@@ -530,8 +575,6 @@ def main() -> None:
             try:
                 source = source.tolist()
             except TypeError:
-                # Fall back to iterating over the original object when ``tolist``
-                # is not supported (e.g. compatibility shims).
                 source = arr
 
         flat: List[int] = []
@@ -539,16 +582,11 @@ def main() -> None:
         while stack:
             item = stack.pop()
             if isinstance(item, (list, tuple)):
-                # ``tolist`` on real numpy arrays returns nested lists for each
-                # dimension.  Iterate depth-first to preserve the original order
-                # when flattening.
                 stack.extend(reversed(item))
                 continue
             try:
                 flat.append(int(item))
             except Exception:
-                # ``bool`` provides a safe fallback for values that are not
-                # directly castable to ``int`` (e.g. numpy scalar proxies).
                 flat.append(int(bool(item)))
 
         flat.reverse()
@@ -578,16 +616,17 @@ def main() -> None:
         guide_lines.clear()
         ax.set_xlim(-0.5, vW - 0.5)
         ax.set_ylim(vH - 0.5, -0.5)
-        y_ticks: List[int] = []
+        y_ticks: List[float] = []
         y_labels: List[str] = []
-        for kib, row in zip(markers_kib, marker_rows_full):
-            if vy0 <= row < (vy0 + vH):
-                y = row - vy0
+        for y_pos, label in marker_specs:
+            if vy0 <= y_pos < (vy0 + vH):
+                y = y_pos - vy0
                 y_ticks.append(y)
-                y_labels.append(f"{kib} KiB")
+                y_labels.append(label)
                 guide_lines.append(ax.axhline(y - 0.5, linewidth=0.6, color="0.7"))
         ax.set_yticks(y_ticks)
         ax.set_yticklabels(y_labels)
+        ax.tick_params(axis="y", which="both", labelsize=8, pad=4)
         ax.tick_params(axis="x", which="both", bottom=False, top=False, labelbottom=False)
         need_axes_refresh = False
 
@@ -610,10 +649,12 @@ def main() -> None:
         need_axes_refresh = True
 
     fig = plt.figure(figsize=(14, 6))
-    gs = fig.add_gridspec(nrows=1, ncols=3, width_ratios=[3, 2, 2])
+    gs = fig.add_gridspec(nrows=1, ncols=4, width_ratios=[3, 1.2, 2, 2])
     ax = fig.add_subplot(gs[0, 0])
-    ax_mag = fig.add_subplot(gs[0, 1])
-    ax_vga = fig.add_subplot(gs[0, 2])
+    ax_legend = fig.add_subplot(gs[0, 1])
+    ax_mag = fig.add_subplot(gs[0, 2])
+    ax_vga = fig.add_subplot(gs[0, 3])
+    ax_legend.set_axis_off()
     ax_mag.set_title(f"{PANEL_SIZE}×{PANEL_SIZE} CP437 bytes")
     ax_mag.set_axis_off()
     ax_vga.set_title("VGA text @ B800:0000 (80×25)")
@@ -658,6 +699,18 @@ def main() -> None:
         label_text.set_visible(False)
         pointer_artists.append((spec, marker_line, label_text))
 
+    hover_text = ax.text(
+        0.01,
+        0.99,
+        "",
+        transform=ax.transAxes,
+        color="white",
+        fontsize=9,
+        ha="left",
+        va="top",
+        bbox=dict(facecolor=(0.0, 0.0, 0.0, 0.65), edgecolor="none", pad=1.8),
+    )
+
     font_small = pick_mono_font(13)
     font_vga = pick_mono_font(14)
 
@@ -677,18 +730,8 @@ def main() -> None:
         vga0 = np.zeros((VGA_ROWS, VGA_COLS, 2), dtype=np.uint8)
     im_vga = ax_vga.imshow(render_vga_text(vga0, font_vga), interpolation="nearest", origin="upper")
 
-    raw_mappings: List[MemoryMapping] = []
-    for cmd in ("info mem", "info mtree"):
-        try:
-            mapping_text = qmp.hmp(cmd)
-        except Exception:
-            continue
-        raw_mappings = parse_memory_mappings(mapping_text)
-        if raw_mappings:
-            break
-
-    if raw_mappings:
-        mask_flat, mapping_visible = build_mapping_mask(raw_mappings, pixels)
+    if overlay_mappings:
+        mask_flat, mapping_visible = build_mapping_mask(overlay_mappings, pixels)
         if mapping_visible:
             mapping_mask_full = mask_flat.reshape(args.height, args.width)
 
@@ -700,16 +743,14 @@ def main() -> None:
                 mapping_data_full = data_flat.reshape(args.height, args.width)
                 mapping_data_mask_full = data_mask_flat.reshape(args.height, args.width)
                 im.set_data(view_slice_with_overlay())
-                im_mag.set_data(
-                    render_text_panel(magnifier_block_at(sx0, sy0), font_small)
-                )
+                im_mag.set_data(render_text_panel(magnifier_block_at(sx0, sy0), font_small))
 
             color_entries = [(0.0, 0.0, 0.0, 0.0)]
-            base_cmap = plt.get_cmap("tab10")
-            for idx in range(len(mapping_visible)):
-                r, g, b, _ = base_cmap(idx % base_cmap.N)
-                color_entries.append((r, g, b, 0.2))
-            overlay_cmap = mcolors.ListedColormap(color_entries, name="mapped_memory")
+            for mapping in mapping_visible:
+                color = region_color_lookup.get((mapping.start, mapping.end, mapping.label), "#cccccc")
+                rgba = mcolors.to_rgba(color, alpha=0.25)
+                color_entries.append(rgba)
+            overlay_cmap = mcolors.ListedColormap(color_entries, name="memory_layout")
             overlay_norm = mcolors.BoundaryNorm(np.arange(len(color_entries) + 1) - 0.5, len(color_entries))
             mapping_overlay_im = ax.imshow(
                 mapping_mask_full[vy0:vy0 + vH, vx0:vx0 + vW],
@@ -725,18 +766,19 @@ def main() -> None:
                 handle = patches.Patch(
                     facecolor=rgba,
                     edgecolor=(rgba[0], rgba[1], rgba[2], min(1.0, rgba[3] + 0.2)),
-                    label=f"{mapping.label} ({mapping.start:06X}-{mapping.end:06X})",
+                    label=f"{mapping.label} (0x{mapping.start:08X}-0x{mapping.end:08X})",
                 )
                 legend_handles.append(handle)
             if legend_handles:
-                mapping_legend = ax.legend(
+                ax_legend.cla()
+                ax_legend.set_axis_off()
+                ax_legend.legend(
                     handles=legend_handles,
                     loc="upper left",
                     fontsize=8,
-                    framealpha=0.6,
-                    title="Mapped memory",
+                    framealpha=0.65,
+                    title="Memory layout",
                 )
-                mapping_legend.set_zorder(mapping_overlay_im.get_zorder() + 0.1)
 
     refresh_axes()
 
@@ -836,6 +878,14 @@ def main() -> None:
 
         im_mag.set_data(render_text_panel(magnifier_block_at(sx, sy), font_small))
 
+        addr = cy * args.width + cx
+        region = find_region_for_address(addr)
+        if region is None:
+            hover_lines = ["Unlabeled memory", f"0x{addr:08X} ({format_kib_from_bytes(addr)})"]
+        else:
+            hover_lines = [region.label, f"0x{addr:08X} ({format_kib_from_bytes(addr)})"]
+        hover_text.set_text("\n".join(hover_lines))
+
         try:
             vga = qmp_read_b800(qmp)
             im_vga.set_data(render_vga_text(vga, font_vga))
@@ -854,7 +904,7 @@ def main() -> None:
         artists = [im]
         if mapping_overlay_im is not None:
             artists.append(mapping_overlay_im)
-        artists.extend([im_mag, im_vga, rect])
+        artists.extend([im_mag, im_vga, rect, hover_text])
         for _, marker_line, label_text in pointer_artists:
             artists.extend((marker_line, label_text))
         return tuple(artists)
